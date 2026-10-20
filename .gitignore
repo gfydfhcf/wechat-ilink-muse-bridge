@@ -1,0 +1,12 @@
+# data/ 里是登录凭证和聊天数据，绝对不要提交
+data/
+session.json
+contacts.json
+chatlog.md
+media/
+*.log
+rescan_notified
+
+__pycache__/
+*.pyc
+.venv/
