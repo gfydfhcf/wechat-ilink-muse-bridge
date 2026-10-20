@@ -17,6 +17,9 @@
 - **连发消息合并** — 用户连发几条会被 iLink 拆成多个响应；本仓库会
   攒一攒、合并成一轮发言，只回一条。**调研过的所有同类 SDK 都不做这个**，
   直接逐条回复的机器人会显得很机械
+- **"正在输入"状态** — 回复生成期间自动亮起 typing 指示
+  （`getconfig` 取 `typing_ticket` + `sendtyping` 开关，票据缓存 9 分钟），
+  等待不干等，对方能看到机器人"活着"
 - **主动推送** — 协议“文档”没写，但 `sendmessage` 配合缓存的
   `context_token` 可以主动给用户发消息（token 失效时有无 token 兜底重试）
 - **媒体下载断点续传** — 图片/文件走加密 CDN，下载中断用 HTTP Range
@@ -78,6 +81,7 @@ python3 daemon.py --echo
 python3 ilink.py poll                                   # 拉一轮新消息（JSON）
 python3 ilink.py send <user_id> <context_token> -       # 发回复（正文走 stdin）
 python3 ilink.py proactive <user_id> -                  # 主动推送（正文走 stdin）
+python3 ilink.py typing <user_id> <start|stop>          # 显示/取消"正在输入"
 ```
 
 数据目录默认 `./data/`，可用环境变量 `ILINK_DATA_DIR` 覆盖。

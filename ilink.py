@@ -8,6 +8,7 @@ Usage:
   ilink.py poll                # fetch new messages since cursor (JSON)
   ilink.py send <to> <ctx> <text>  # send text reply (use - for stdin)
   ilink.py proactive <to> <text>   # proactive push via cached context_token
+  ilink.py typing <to> <start|stop>  # show/cancel the "typing..." indicator
 """
 import base64
 import json
@@ -427,6 +428,70 @@ def cmd_send(to_user_id, context_token, text):
         return 0
 
 
+def _typing_ticket(to_user_id, token, force=False):
+    """取（或刷新）某用户的 typing_ticket，缓存在 contacts 里（TTL 9 分钟）。"""
+    contacts = load_contacts()
+    entry = contacts.get(to_user_id) or {}
+    now = int(time.time())
+    if (not force and entry.get("typing_ticket")
+            and now - entry.get("typing_ticket_at", 0) < 540):
+        return entry["typing_ticket"]
+    ctx = entry.get("context_token")
+    if not ctx:
+        return None
+    data = api("POST", "ilink/bot/getconfig",
+               {"ilink_user_id": to_user_id, "context_token": ctx,
+                "base_info": {"channel_version": "1.0.2"}},
+               token=token, timeout=20)
+    ticket = data.get("typing_ticket")
+    if ticket:
+        entry["typing_ticket"] = ticket
+        entry["typing_ticket_at"] = now
+        contacts[to_user_id] = entry
+        save_contacts(contacts)
+    return ticket
+
+
+def cmd_typing(to_user_id, status_word):
+    """显示/取消"正在输入"状态：status_word = start | stop。这是装饰性功能，
+    失败绝不影响正常回复流程（调用方应忽略失败）。"""
+    status = {"start": 1, "stop": 2}.get(status_word)
+    if status is None:
+        print("TYPING_BAD_STATUS")
+        return 2
+    s = load_session()
+    token = s.get("bot_token")
+    if not token:
+        print("NO_TOKEN")
+        return 1
+    try:
+        ticket = _typing_ticket(to_user_id, token)
+        if not ticket:
+            print("NO_TYPING_TICKET")
+            return 1
+        data = api("POST", "ilink/bot/sendtyping",
+                   {"ilink_user_id": to_user_id, "typing_ticket": ticket,
+                    "status": status,
+                    "base_info": {"channel_version": "1.0.2"}},
+                   token=token, timeout=20)
+        if data.get("ret", 0) != 0:
+            # ticket 可能已失效，强制刷新后重试一次
+            ticket = _typing_ticket(to_user_id, token, force=True)
+            data = api("POST", "ilink/bot/sendtyping",
+                       {"ilink_user_id": to_user_id, "typing_ticket": ticket,
+                        "status": status,
+                        "base_info": {"channel_version": "1.0.2"}},
+                       token=token, timeout=20)
+            if data.get("ret", 0) != 0:
+                print(f"TYPING_FAILED:{str(data)[:200]}")
+                return 1
+    except Exception as e:
+        print(f"TYPING_ERROR:{e}")
+        return 1
+    print("TYPING_OK")
+    return 0
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "qrcode":
@@ -439,6 +504,8 @@ if __name__ == "__main__":
         sys.exit(cmd_send(sys.argv[2], sys.argv[3], sys.argv[4]))
     elif cmd == "proactive":
         sys.exit(cmd_proactive(sys.argv[2], sys.argv[3]))
+    elif cmd == "typing":
+        sys.exit(cmd_typing(sys.argv[2], sys.argv[3]))
     else:
         print(__doc__)
         sys.exit(2)

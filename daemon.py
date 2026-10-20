@@ -65,6 +65,17 @@ def collect_burst(first_msgs):
     return msgs
 
 
+def _typing(user, word):
+    """Best-effort 'typing...' indicator; failures are ignored by design."""
+    try:
+        subprocess.run(
+            [sys.executable, os.path.join(HERE, "ilink.py"), "typing", user, word],
+            capture_output=True, timeout=30,
+        )
+    except Exception:
+        pass
+
+
 def handle_burst(msgs, echo=False):
     """One user turn. Replace this with your own agent/LLM call."""
     by_user = {}
@@ -76,10 +87,14 @@ def handle_burst(msgs, echo=False):
         if echo:
             ctx = items[-1]["context_token"]  # always reply with the latest ctx
             reply = "收到：" + " ".join(texts)
-            subprocess.run(
-                [sys.executable, os.path.join(HERE, "ilink.py"), "send", user, ctx, "-"],
-                input=reply, text=True, timeout=120,
-            )
+            _typing(user, "start")  # show "typing..." while the reply goes out
+            try:
+                subprocess.run(
+                    [sys.executable, os.path.join(HERE, "ilink.py"), "send", user, ctx, "-"],
+                    input=reply, text=True, timeout=120,
+                )
+            finally:
+                _typing(user, "stop")
 
 
 def main():
