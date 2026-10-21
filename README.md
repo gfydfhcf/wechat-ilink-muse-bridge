@@ -11,6 +11,17 @@
 核心客户端 `ilink.py` 不依赖任何框架，单独拿走就是一个极简 iLink 客户端；
 仓库同时给出两种长轮询接法：独立 `daemon.py`，和生产在用的 Muse hook 方案。
 
+## 在 Muse 里快速部署
+
+把这句话发给你的 Muse：
+
+```
+帮我用 wechat-ilink-muse-bridge 把微信接入你：https://github.com/gfydfhcf/wechat-ilink-muse-bridge
+```
+
+它会按仓库根目录的 [`AGENTS.md`](AGENTS.md) 自己完成部署，你只需要
+在扫码那一步拿出微信扫一下。
+
 ## 特性
 
 - **官方协议，扫码登录** — 不用逆向、不用挂个人号，走腾讯 iLink 官方通道

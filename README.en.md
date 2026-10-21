@@ -14,6 +14,17 @@ The core client `ilink.py` is framework-free — lift it out on its own and you
 have a minimal iLink client. The repo also ships two long-polling drivers:
 a standalone `daemon.py`, and the Muse hook setup used in production.
 
+## Quick deploy inside Muse
+
+Send this sentence to your Muse:
+
+```
+Use wechat-ilink-muse-bridge to connect WeChat to you: https://github.com/gfydfhcf/wechat-ilink-muse-bridge
+```
+
+It will deploy everything itself by following [`AGENTS.md`](AGENTS.md) in the
+repo root — you only need to pick up WeChat once, at the QR-scan step.
+
 ## Features
 
 - **Official protocol, QR-code login** — no reverse engineering, no
