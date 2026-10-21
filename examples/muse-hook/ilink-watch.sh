@@ -30,6 +30,12 @@ if [ -s "$PENDING" ]; then
   cnt=$(jq 'length' "$PENDING" 2>/dev/null || echo 0)
   if [ "$cnt" -gt 0 ] 2>/dev/null; then
     log "pending $cnt messages waiting"
+    # Leftover batches also light the typing indicator immediately (owner only)
+    owner=$(jq -r '.owner_id // empty' "$BRIDGE/owner.json" 2>/dev/null || true)
+    sender=$(jq -r '.msgs[0].from_user_id // empty' "$PENDING" 2>/dev/null || true)
+    if [ -n "$owner" ] && [ "$sender" = "$owner" ]; then
+      python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" typing "$sender" start >/dev/null 2>&1 || true
+    fi
     wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"}"
   else
     silent "pending file empty"
@@ -63,6 +69,14 @@ else
       printf '%s' "$out" > "$tmp"
       mv "$tmp" "$PENDING"
       log "received $cnt messages"
+      # Light the "typing..." indicator the moment the batch lands (owner
+      # only) instead of waiting for the worker agent to boot — the worker's
+      # own typing start then just acts as a keep-alive refresh.
+      owner=$(jq -r '.owner_id // empty' "$BRIDGE/owner.json" 2>/dev/null || true)
+      sender=$(printf '%s' "$out" | jq -r '.msgs[0].from_user_id // empty' 2>/dev/null || true)
+      if [ "$DRY" != "1" ] && [ -n "$owner" ] && [ "$sender" = "$owner" ]; then
+        python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" typing "$sender" start >/dev/null 2>&1 || true
+      fi
       if [ "$DRY" != "1" ]; then
         wake "new_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"}"
       else
