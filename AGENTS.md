@@ -33,6 +33,10 @@ each batch to a pending queue before waking you, and you claim it with an
 atomic `mv`. When woken, handle the batch under this contract:
 
 - Reply only to the owner (first sender; stored in `owner.json`).
+- After claiming with `mv`, immediately `touch` the processing file:
+  crash recovery judges staleness by file timestamps, and `mv` preserves
+  the message-arrival time — an un-refreshed claim can be mistaken for a
+  stale one and bounced back to pending.
 - One reply per burst: before sending, re-check the pending file; if newer
   messages arrived while you composed, merge them and re-compose against
   the newest context (max 3 rounds).

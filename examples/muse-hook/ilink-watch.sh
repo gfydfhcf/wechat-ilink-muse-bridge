@@ -20,7 +20,12 @@ DRY=${HATCH_HOOK_DRY_RUN:-0}
 now() { date '+%Y-%m-%d %H:%M:%S'; }
 
 # 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
-if [ -f "$PROC" ] && [ -n "$(find "$PROC" -mmin +10 2>/dev/null || true)" ]; then
+# 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
+# 注意：必须用 -cmin（inode 变更时间）而非 -mmin（内容修改时间）：
+# worker 用 mv 认领队列时 mtime 保留为消息落盘时间，若消息在 pending 里
+# 积压超过 10 分钟，认领瞬间就会被误判过期、打回 pending 形成乒乓循环。
+# mv 会刷新 ctime，ctime 才是真正的“被认领时间”。
+if [ -f "$PROC" ] && [ -n "$(find "$PROC" -cmin +10 2>/dev/null || true)" ]; then
   mv "$PROC" "$PENDING"
   log "recovered stale processing file to pending"
 fi
