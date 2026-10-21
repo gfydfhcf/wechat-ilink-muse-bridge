@@ -129,9 +129,11 @@ The data directory defaults to `./data/` and can be overridden with the
 
 ## Known limitations (the fine print, up front)
 
-- **Sessions are short-lived**: community experience puts them at roughly
-  24 hours; expiry means a human has to re-scan the QR code (this repo only
-  implements "notify once" — re-scanning is still manual).
+- **Session lifetime is uncertain**: early community reports suggested
+  roughly 24 hours, but in production a single login here has stayed valid
+  for 3+ days (Oct 2026); it may vary by account. Expiry means a human has
+  to re-scan the QR code (this repo only implements "notify once" —
+  re-scanning is still manual).
 - **Bots only see messages sent to the bot**: iLink is a separate bot
   identity. It cannot see your main account's messages, contacts, or
   Moments — the official protocol simply has no such endpoints. Anyone

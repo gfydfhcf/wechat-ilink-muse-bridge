@@ -57,9 +57,10 @@ python3 ilink.py proactive <user_id> -   # text via stdin
 
 ## 4. Ongoing behavior
 
-- The session lasts roughly 24h (community experience). When commands
-  report `TOKEN_EXPIRED` / `NO_TOKEN`, ask the user to re-scan — once, not
-  repeatedly.
+- Session lifetime is unpredictable: early community reports suggested
+  roughly 24h, but in production one login has stayed valid for 3+ days.
+  When commands report `TOKEN_EXPIRED` / `NO_TOKEN`, ask the user to
+  re-scan — once, not repeatedly.
 - The bot only receives messages sent **to the bot**. It cannot read the
   user's main-account chats, contacts, or Moments; the protocol has no
   such endpoints. Do not promise otherwise.
