@@ -1,5 +1,7 @@
 # Muse hook 变体：把“长轮询”塞进 Muse 的 hook 机制里
 
+[中文](README.md) | [English](README.en.md)
+
 `daemon.py` 是给普通环境用的常驻长轮询循环。但 Muse 运行时里已经有
 现成的 agent 调度，不需要再养一个调 LLM 的进程——本目录是生产环境
 实际在用的另一种接法：
@@ -17,7 +19,7 @@
         ilink-pending.json          ← 待处理队列（原子写入，断电不丢）
                       │  worker 用 mv 原子认领 → ilink-processing.json
                       ▼
-              Muse worker agent     ← 等 ~25s 合并连发消息，只回一条；
+              Muse worker agent     ← 发送前复查队列、合并连发，只回一条；
                                       超过 10 分钟没处理完的批次会被
                                       脚本退回 pending 重新唤醒
 ```
@@ -31,6 +33,8 @@
 - **连发合并**：用户连发几条时 iLink 会拆成多个响应。worker 不做固定
   等待，而是**发送前复查**：回复组织好、真正发出之前再看一眼队列，
   有新消息就合并进来、按最新上下文重新组织回复，最后只回一条。
+- **"正在输入"秒亮**：消息落盘那一刻，脚本核对发信人是主人后立即点亮
+  typing 指示，不等 worker 冷启动；worker 侧的点亮只作续期。
 - **token 过期只通知一次**：脚本发现 `TOKEN_EXPIRED` 时创建
   `rescan_notified` 标记并唤醒 agent 通知用户重扫；标记在就不再打扰。
 
