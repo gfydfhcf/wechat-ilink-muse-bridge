@@ -1,5 +1,7 @@
 # wechat-ilink-muse-bridge
 
+[中文](README.md) | [English](README.en.md)
+
 **把 Muse（Meta 的个人 AI 助理）接进微信。**
 
 基于腾讯官方 iLink / ClawBot 协议（`ilinkai.weixin.qq.com`），扫码授权后，
@@ -14,9 +16,13 @@
 - **官方协议，扫码登录** — 不用逆向、不用挂个人号，走腾讯 iLink 官方通道
 - **长轮询实时收消息** — 服务端 hold 住连接最长 35s，有消息立即返回，
   延迟秒级（同类项目清一色这个做法，本仓库的参数与退避策略可直接抄）
-- **连发消息合并** — 用户连发几条会被 iLink 拆成多个响应；本仓库会
-  攒一攒、合并成一轮发言，只回一条。**调研过的所有同类 SDK 都不做这个**，
-  直接逐条回复的机器人会显得很机械
+- **连发消息合并** — 用户连发几条会被 iLink 拆成多个响应；本仓库的做法是
+  **发送前复查**：回复组织好、真正发出之前再看一眼有没有新消息进来，
+  有就合并成一轮、按最新上下文回，只回一条。**调研过的所有同类 SDK
+  都不做这个**，直接逐条回复的机器人会显得很机械，还会慢一拍答非所问
+- **发送图片/文件** — 走 `getuploadurl` 申请上传 → AES-128-ECB 加密 →
+  CDN 上传 → `sendmessage` 带媒体 item，图片和文件都支持（回复和主动
+  推送两种模式）。协议细节有坑（两处枚举/编码不一致），代码里有注释
 - **"正在输入"状态** — 回复生成期间自动亮起 typing 指示
   （`getconfig` 取 `typing_ticket` + `sendtyping` 开关，票据缓存 9 分钟），
   等待不干等，对方能看到机器人"活着"
@@ -82,6 +88,10 @@ python3 ilink.py poll                                   # 拉一轮新消息（J
 python3 ilink.py send <user_id> <context_token> -       # 发回复（正文走 stdin）
 python3 ilink.py proactive <user_id> -                  # 主动推送（正文走 stdin）
 python3 ilink.py typing <user_id> <start|stop>          # 显示/取消"正在输入"
+python3 ilink.py send-image <user_id> <ctx> <图片路径>   # 回复一张图片
+python3 ilink.py send-file <user_id> <ctx> <文件路径>    # 回复一个文件
+python3 ilink.py proactive-image <user_id> <图片路径>    # 主动推送图片
+python3 ilink.py proactive-file <user_id> <文件路径>     # 主动推送文件
 ```
 
 数据目录默认 `./data/`，可用环境变量 `ILINK_DATA_DIR` 覆盖。

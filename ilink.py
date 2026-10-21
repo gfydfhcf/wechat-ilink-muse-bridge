@@ -9,6 +9,10 @@ Usage:
   ilink.py send <to> <ctx> <text>  # send text reply (use - for stdin)
   ilink.py proactive <to> <text>   # proactive push via cached context_token
   ilink.py typing <to> <start|stop>  # show/cancel the "typing..." indicator
+  ilink.py send-image <to> <ctx> <path>   # reply with an image
+  ilink.py send-file <to> <ctx> <path>    # reply with a file
+  ilink.py proactive-image <to> <path>    # proactive image via cached ctx
+  ilink.py proactive-file <to> <path>     # proactive file via cached ctx
 """
 import base64
 import json
@@ -492,6 +496,165 @@ def cmd_typing(to_user_id, status_word):
     return 0
 
 
+def _aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.padding import PKCS7
+    padder = PKCS7(128).padder()
+    padded = padder.update(data) + padder.finalize()
+    enc = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return enc.update(padded) + enc.finalize()
+
+
+def _send_item_raw(to_user_id, context_token, item, token, client_id=None):
+    """sendmessage 的通用封装：item 是任意 MessageItem（文本/图片/文件）。"""
+    if client_id is None:
+        client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
+    body = {
+        "msg": {
+            "from_user_id": "",
+            "to_user_id": to_user_id,
+            "client_id": client_id,
+            "message_type": 2,
+            "message_state": 2,
+            "item_list": [item],
+        },
+        "base_info": {"channel_version": "1.0.2"},
+    }
+    if context_token:
+        body["msg"]["context_token"] = context_token
+    return api("POST", "ilink/bot/sendmessage", body, token=token, timeout=40)
+
+
+def _upload_media(to_user_id, data, media_type, token):
+    """把媒体字节加密上传到微信 CDN。返回构造消息 item 所需的字段 dict。
+    协议要点（实测）：getuploadurl 的 aeskey 传 hex 字符串；消息里
+    CDNMedia.aes_key 用 base64(hex 字符串)；CDN 上传响应头 x-encrypted-param
+    即下载参数。"""
+    import hashlib
+    from urllib.parse import quote
+    key = os.urandom(16)
+    aeskey_hex = key.hex()
+    filekey = "%032x" % random.getrandbits(128)
+    ciphertext = _aes_ecb_encrypt(data, key)
+    # 注意：getuploadurl 的 media_type 是另一套枚举（1=IMG, 2=VID, 3=FILE, 4=VOICE），
+    # 与消息 item 类型（2=IMAGE, 4=FILE）不同，必须映射。
+    upload_type = {2: 1, 4: 3}[media_type]
+    body = {
+        "filekey": filekey,
+        "media_type": upload_type,
+        "to_user_id": to_user_id,
+        "rawsize": len(data),
+        "rawfilemd5": hashlib.md5(data).hexdigest(),
+        "filesize": len(ciphertext),
+        "aeskey": aeskey_hex,
+        "no_need_thumb": True,
+        "base_info": {"channel_version": "1.0.2"},
+    }
+    r = api("POST", "ilink/bot/getuploadurl", body, token=token, timeout=20)
+    upload_param = r.get("upload_param")
+    if not upload_param:
+        raise RuntimeError(f"getuploadurl no upload_param: {str(r)[:200]}")
+    url = (f"{CDN_BASE_URL}/upload?encrypted_query_param="
+           f"{quote(upload_param, safe='')}&filekey={filekey}")
+    req = urllib.request.Request(url, data=ciphertext, method="POST",
+                                 headers={"Content-Type": "application/octet-stream"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        download_param = resp.headers.get("x-encrypted-param")
+    if not download_param:
+        raise RuntimeError("CDN upload: no x-encrypted-param header")
+    return {
+        "media": {"encrypt_query_param": download_param,
+                  "aes_key": base64.b64encode(aeskey_hex.encode("ascii")).decode("ascii"),
+                  "encrypt_type": 1},
+        "md5": body["rawfilemd5"],
+        "rawsize": len(data),
+        "cipher_size": len(ciphertext),
+    }
+
+
+def _media_item(path, up, media_type):
+    if media_type == 2:  # IMAGE
+        return {"type": 2, "image_item": {"media": up["media"],
+                                          "mid_size": up["cipher_size"]}}
+    # FILE
+    return {"type": 4, "file_item": {"media": up["media"],
+                                     "file_name": os.path.basename(path),
+                                     "md5": up["md5"],
+                                     "len": str(up["rawsize"])}}
+
+
+def cmd_send_media(to_user_id, context_token, path, media_type):
+    """发送图片/文件（回复模式，需 context_token）。"""
+    s = load_session()
+    token = s.get("bot_token")
+    if not token:
+        print("NO_TOKEN")
+        return 1
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        print(f"MEDIA_READ_ERROR:{e}")
+        return 1
+    try:
+        up = _upload_media(to_user_id, data, media_type, token)
+        item = _media_item(path, up, media_type)
+        data_resp = _send_item_raw(to_user_id, context_token, item, token)
+    except Exception as e:
+        print(f"SEND_ERROR:{e}")
+        return 1
+    code = data_resp.get("code", 0)
+    if code == -14:
+        print("TOKEN_EXPIRED")
+        return 2
+    if code != 0 or not data_resp.get("message_id"):
+        print(f"SEND_FAILED:{str(data_resp)[:200]}")
+        return 1
+    print("SEND_OK")
+    return 0
+
+
+def cmd_proactive_media(to_user_id, path, media_type):
+    """主动推送图片/文件：用缓存的 context_token，失败则去掉 token 重试一次。"""
+    s = load_session()
+    token = s.get("bot_token")
+    if not token:
+        print("NO_TOKEN")
+        return 1
+    contacts = load_contacts()
+    ctx = (contacts.get(to_user_id) or {}).get("context_token")
+    if not ctx:
+        print("NO_CONTEXT_TOKEN")
+        return 1
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        up = _upload_media(to_user_id, data, media_type, token)
+        item = _media_item(path, up, media_type)
+        data_resp = _send_item_raw(to_user_id, ctx, item, token)
+    except Exception as e:
+        print(f"SEND_ERROR:{e}")
+        return 1
+    ok = data_resp.get("code", 0) == 0 and data_resp.get("message_id")
+    if data_resp.get("code", 0) == -14:
+        print("TOKEN_EXPIRED")
+        return 2
+    if not ok:
+        try:
+            data_resp = _send_item_raw(to_user_id, None, item, token)
+        except Exception as e:
+            print(f"SEND_ERROR:{e}")
+            return 1
+        if data_resp.get("code", 0) == -14:
+            print("TOKEN_EXPIRED")
+            return 2
+        if data_resp.get("code", 0) != 0 or not data_resp.get("message_id"):
+            print(f"PROACTIVE_FAILED:{str(data_resp)[:200]}")
+            return 1
+    print("PROACTIVE_OK")
+    return 0
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "qrcode":
@@ -506,6 +669,14 @@ if __name__ == "__main__":
         sys.exit(cmd_proactive(sys.argv[2], sys.argv[3]))
     elif cmd == "typing":
         sys.exit(cmd_typing(sys.argv[2], sys.argv[3]))
+    elif cmd == "send-image":
+        sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 2))
+    elif cmd == "send-file":
+        sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 4))
+    elif cmd == "proactive-image":
+        sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 2))
+    elif cmd == "proactive-file":
+        sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 4))
     else:
         print(__doc__)
         sys.exit(2)
