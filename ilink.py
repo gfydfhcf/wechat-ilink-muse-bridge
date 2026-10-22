@@ -13,10 +13,12 @@ Usage:
   ilink.py send-image <to> <ctx> <path>   # reply with an image
   ilink.py send-file <to> <ctx> <path>    # reply with a file
   ilink.py send-video <to> <ctx> <path>   # reply with a video
+  ilink.py send-voice <to> <ctx> <path> <playtime_ms>   # voice msg (SILK@24k; NOTE: channel silently drops outbound voice)
   ilink.py proactive-image <to> <path>    # proactive image via cached ctx
   ilink.py proactive-file <to> <path>     # proactive file via cached ctx
   ilink.py health [--offline]  # self-check: auth, queue, last poll (exit 0 ok / 1 warn / 2 bad)
   ilink.py proactive-video <to> <path>    # proactive video via cached ctx
+  ilink.py proactive-voice <to> <path> <playtime_ms>   # proactive voice (dropped by channel, see send-voice)
 """
 import base64
 import json
@@ -631,7 +633,7 @@ def _upload_media(to_user_id, data, media_type, token):
     ciphertext = _aes_ecb_encrypt(data, key)
     # 注意：getuploadurl 的 media_type 是另一套枚举（1=IMG, 2=VID, 3=FILE, 4=VOICE），
     # 与消息 item 类型（2=IMAGE, 4=FILE）不同，必须映射。
-    upload_type = {2: 1, 4: 3, 5: 2}[media_type]
+    upload_type = {2: 1, 3: 4, 4: 3, 5: 2}[media_type]
     body = {
         "filekey": filekey,
         "media_type": upload_type,
@@ -665,10 +667,20 @@ def _upload_media(to_user_id, data, media_type, token):
     }
 
 
-def _media_item(path, up, media_type):
+def _media_item(path, up, media_type, playtime_ms=0):
     if media_type == 2:  # IMAGE
         return {"type": 2, "image_item": {"media": up["media"],
                                           "mid_size": up["cipher_size"]}}
+    if media_type == 3:  # VOICE (experimental): audio must be SILK@24kHz
+        # NOTE: the iLink channel silently drops outbound voice items —
+        # the API returns success but the client never shows them
+        # (verified live 2026-10-22; other SDKs document the same).
+        # Kept for completeness; send audio as FILE (wav) instead.
+        return {"type": 3, "voice_item": {"media": up["media"],
+                                          "encode_type": 6,
+                                          "bits_per_sample": 16,
+                                          "sample_rate": 24000,
+                                          "playtime": int(playtime_ms)}}
     if media_type == 5:  # VIDEO (thumb optional: getuploadurl says no_need_thumb)
         return {"type": 5, "video_item": {"media": up["media"],
                                           "video_size": up["cipher_size"]}}
@@ -679,7 +691,7 @@ def _media_item(path, up, media_type):
                                      "len": str(up["rawsize"])}}
 
 
-def cmd_send_media(to_user_id, context_token, path, media_type):
+def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0):
     """发送图片/视频/文件（回复模式，需 context_token）。"""
     s = load_session()
     token = s.get("bot_token")
@@ -694,7 +706,7 @@ def cmd_send_media(to_user_id, context_token, path, media_type):
         return 1
     try:
         up = _upload_media(to_user_id, data, media_type, token)
-        item = _media_item(path, up, media_type)
+        item = _media_item(path, up, media_type, playtime_ms)
         data_resp = _send_item_raw(to_user_id, context_token, item, token)
     except Exception as e:
         print(f"SEND_ERROR:{e}")
@@ -710,7 +722,7 @@ def cmd_send_media(to_user_id, context_token, path, media_type):
     return 0
 
 
-def cmd_proactive_media(to_user_id, path, media_type):
+def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0):
     """主动推送图片/视频/文件：用缓存的 context_token，失败则去掉 token 重试一次。"""
     s = load_session()
     token = s.get("bot_token")
@@ -726,7 +738,7 @@ def cmd_proactive_media(to_user_id, path, media_type):
         with open(path, "rb") as f:
             data = f.read()
         up = _upload_media(to_user_id, data, media_type, token)
-        item = _media_item(path, up, media_type)
+        item = _media_item(path, up, media_type, playtime_ms)
         data_resp = _send_item_raw(to_user_id, ctx, item, token)
     except Exception as e:
         print(f"SEND_ERROR:{e}")
@@ -890,12 +902,18 @@ if __name__ == "__main__":
         sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 4))
     elif cmd == "send-video":
         sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 5))
+    elif cmd == "send-voice":
+        sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 3,
+                                int(sys.argv[5]) if len(sys.argv) > 5 else 0))
     elif cmd == "proactive-image":
         sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 2))
     elif cmd == "proactive-file":
         sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 4))
     elif cmd == "proactive-video":
         sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 5))
+    elif cmd == "proactive-voice":
+        sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 3,
+                                     int(sys.argv[4]) if len(sys.argv) > 4 else 0))
     else:
         print(__doc__)
         sys.exit(2)
