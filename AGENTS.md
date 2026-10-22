@@ -48,7 +48,12 @@ atomic `mv`. When woken, handle the batch under this contract:
   document (PDF/Office/text/code) and answer from its contents instead
   of claiming you cannot open files. Only say so when the download
   failed (`media_error`) or the format is truly unreadable; video
-  contents remain out of reach.
+  contents remain out of reach. For a large file (~50 KB+), send a
+  short receipt first ("got your 《name》, it's a big spreadsheet, give
+  me a moment"), then sample-read (head + totals/structure) for the
+  real reply and deep-read on follow-up questions — and always cite at
+  least one detail only a real read could know (a count, a first item,
+  a number), never a summary guessed from the file name.
 - Never manually retry a failed send; the client already retries once with
   the same client_id.
 - On `token_expired`, tell the user once that a re-scan is needed.
