@@ -110,8 +110,10 @@ python3 ilink.py proactive <user_id> -                  # 主动推送（正文�
 python3 ilink.py typing <user_id> <start|stop>          # 显示/取消"正在输入"
 python3 ilink.py send-image <user_id> <ctx> <图片路径>   # 回复一张图片
 python3 ilink.py send-file <user_id> <ctx> <文件路径>    # 回复一个文件
+python3 ilink.py send-video <user_id> <ctx> <视频路径>   # 回复一个视频
 python3 ilink.py proactive-image <user_id> <图片路径>    # 主动推送图片
 python3 ilink.py proactive-file <user_id> <文件路径>     # 主动推送文件
+python3 ilink.py proactive-video <user_id> <视频路径>    # 主动推送视频
 ```
 
 数据目录默认 `./data/`，可用环境变量 `ILINK_DATA_DIR` 覆盖。

@@ -11,8 +11,10 @@ Usage:
   ilink.py typing <to> <start|stop>  # show/cancel the "typing..." indicator
   ilink.py send-image <to> <ctx> <path>   # reply with an image
   ilink.py send-file <to> <ctx> <path>    # reply with a file
+  ilink.py send-video <to> <ctx> <path>   # reply with a video
   ilink.py proactive-image <to> <path>    # proactive image via cached ctx
   ilink.py proactive-file <to> <path>     # proactive file via cached ctx
+  ilink.py proactive-video <to> <path>    # proactive video via cached ctx
 """
 import base64
 import json
@@ -538,7 +540,7 @@ def _upload_media(to_user_id, data, media_type, token):
     ciphertext = _aes_ecb_encrypt(data, key)
     # 注意：getuploadurl 的 media_type 是另一套枚举（1=IMG, 2=VID, 3=FILE, 4=VOICE），
     # 与消息 item 类型（2=IMAGE, 4=FILE）不同，必须映射。
-    upload_type = {2: 1, 4: 3}[media_type]
+    upload_type = {2: 1, 4: 3, 5: 2}[media_type]
     body = {
         "filekey": filekey,
         "media_type": upload_type,
@@ -576,6 +578,9 @@ def _media_item(path, up, media_type):
     if media_type == 2:  # IMAGE
         return {"type": 2, "image_item": {"media": up["media"],
                                           "mid_size": up["cipher_size"]}}
+    if media_type == 5:  # VIDEO (thumb optional: getuploadurl says no_need_thumb)
+        return {"type": 5, "video_item": {"media": up["media"],
+                                          "video_size": up["cipher_size"]}}
     # FILE
     return {"type": 4, "file_item": {"media": up["media"],
                                      "file_name": os.path.basename(path),
@@ -584,7 +589,7 @@ def _media_item(path, up, media_type):
 
 
 def cmd_send_media(to_user_id, context_token, path, media_type):
-    """发送图片/文件（回复模式，需 context_token）。"""
+    """发送图片/视频/文件（回复模式，需 context_token）。"""
     s = load_session()
     token = s.get("bot_token")
     if not token:
@@ -615,7 +620,7 @@ def cmd_send_media(to_user_id, context_token, path, media_type):
 
 
 def cmd_proactive_media(to_user_id, path, media_type):
-    """主动推送图片/文件：用缓存的 context_token，失败则去掉 token 重试一次。"""
+    """主动推送图片/视频/文件：用缓存的 context_token，失败则去掉 token 重试一次。"""
     s = load_session()
     token = s.get("bot_token")
     if not token:
@@ -673,10 +678,14 @@ if __name__ == "__main__":
         sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 2))
     elif cmd == "send-file":
         sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 4))
+    elif cmd == "send-video":
+        sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 5))
     elif cmd == "proactive-image":
         sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 2))
     elif cmd == "proactive-file":
         sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 4))
+    elif cmd == "proactive-video":
+        sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 5))
     else:
         print(__doc__)
         sys.exit(2)

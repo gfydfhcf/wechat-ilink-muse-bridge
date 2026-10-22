@@ -134,8 +134,10 @@ python3 ilink.py proactive <user_id> -                  # proactive push (body v
 python3 ilink.py typing <user_id> <start|stop>          # show/cancel "typing…"
 python3 ilink.py send-image <user_id> <ctx> <image>     # reply with an image
 python3 ilink.py send-file <user_id> <ctx> <file>       # reply with a file
+python3 ilink.py send-video <user_id> <ctx> <video>     # reply with a video
 python3 ilink.py proactive-image <user_id> <image>      # proactively push an image
 python3 ilink.py proactive-file <user_id> <file>        # proactively push a file
+python3 ilink.py proactive-video <user_id> <video>      # proactively push a video
 ```
 
 The data directory defaults to `./data/` and can be overridden with the
