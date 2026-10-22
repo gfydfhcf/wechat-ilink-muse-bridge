@@ -133,7 +133,11 @@ LLM_API_KEY=sk-... python3 daemon.py --llm
 stdlib only. For an agent setup with tools and long-term memory, see
 `examples/muse-hook/`.
 
-Or deploy with Docker (session and media persist in the `./data` volume):
+Docker works too — this route is mainly for **self-hosting on your own
+VPS / NAS**: run the standalone `daemon.py` on a server around the clock,
+independent of a Muse environment. (Deploying inside Muse uses the
+AGENTS.md route above — no Docker needed, and Muse sandboxes usually
+don't have Docker anyway.) Session and media persist in the `./data` volume:
 
 ```bash
 docker compose run --rm bot python3 ilink.py qrcode        # QR login, once

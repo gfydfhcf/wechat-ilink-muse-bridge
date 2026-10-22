@@ -108,7 +108,10 @@ LLM_API_KEY=sk-... python3 daemon.py --llm
 
 `--llm` 是示例 handler：带每用户最近 10 条上下文、纯标准库实现。需要工具调用/长期记忆的 Agent 接法见 `examples/muse-hook/`。
 
-或者用 Docker 一键部署（登录态和媒体都存在 `./data` 卷里）：
+也可以用 Docker 部署——这条路线主要面向**在自己 VPS / NAS 上自托管**
+的用户：把独立 `daemon.py` 挂在服务器上 24 小时跑，不依赖 Muse 环境。
+（在 Muse 里部署走上面的 AGENTS.md 方式即可，不需要 Docker——
+Muse 的运行环境里通常也没有 Docker。）登录态和媒体存在 `./data` 卷里：
 
 ```bash
 docker compose run --rm bot python3 ilink.py qrcode        # 扫码登录一次
