@@ -3,6 +3,9 @@
 # 每一轮脚本运行 = 一次 getupdates 长轮询（服务端 hold 最多 35s，有消息立刻返回）。
 # 有新消息 -> 写入 pending 队列并 wake，由 worker agent 生成回复；
 # 无消息/出错 -> silent。
+# poll 是两段式的：ilink.py poll 只拉取、不推进游标不记去重 ID；本脚本把
+# 批次原子落盘 pending 之后才调 ilink.py commit 提交。任何一步崩溃，
+# 消息都会在下一轮被重新拉到——宁可重复，绝不丢失。
 # 告警闭环（alert-state.json 状态机）：
 #   - token 过期：首次立即 wake 报一次，之后每小时复报一次（payload 带 repeat/hours）
 #   - 轮询连续失败：满 10 分钟才报（防抖动误报），之后每小时复报一次
@@ -47,7 +50,13 @@ aset() {
 # worker 用 mv 认领队列时 mtime 保留为消息落盘时间，若消息在 pending 里
 # 积压超过 10 分钟，认领瞬间就会被误判过期、打回 pending 形成乒乓循环。
 # mv 会刷新 ctime，ctime 才是真正的“被认领时间”。
-if [ -f "$PROC" ] && [ -n "$(find "$PROC" -cmin +10 2>/dev/null || true)" ]; then
+# 待处理队列里还有批次时不回收：先处理排队中的（它更新），卡住的下一轮再说。
+# 否则 mv 会覆盖掉尚未处理的新批次——覆盖即永久丢失。
+pending_msgs=0
+if [ -s "$PENDING" ]; then
+  pending_msgs=$(jq '[.msgs[]?] | length' "$PENDING" 2>/dev/null || echo 0)
+fi
+if [ -f "$PROC" ] && [ "${pending_msgs:-0}" -eq 0 ] && [ -n "$(find "$PROC" -cmin +10 2>/dev/null || true)" ]; then
   mv "$PROC" "$PENDING"
   log "recovered stale processing file to pending"
   # 卡住计时：能被回收说明这一轮处理至少已卡了 10 分钟，起点回拨 600 秒
@@ -109,9 +118,11 @@ else
     else
       silent "token expired, repeat alert throttled"
     fi
-  elif [[ "$out" == POLL_ERROR* ]]; then
+  elif [[ "$out" == POLL_ERROR* ]] || ! printf '%s' "$out" | jq -e 'type == "object" and has("msgs")' >/dev/null 2>&1; then
+    # POLL_ERROR，或 poll 进程硬崩溃（空输出/非法 JSON/缺 msgs 字段）。
+    # 崩溃若不进本分支，会被误判成"没有新消息"、故障永远不告警。
     if [ "$DRY" != "1" ]; then
-      echo "[$(now)] $out" >> "$POLLLOG"
+      echo "[$(now)] $(printf '%s' "${out:-POLL_CRASH:empty-or-invalid-output}" | head -c 200)" >> "$POLLLOG"
     fi
     err_since=$(astate err_since)
     if [ "$err_since" -eq 0 ]; then
@@ -154,34 +165,47 @@ else
       aset err_last 0
     fi
     cnt=$(printf '%s' "$out" | jq '[.msgs[]?] | length' 2>/dev/null || echo 0)
-    if [ "${cnt:-0}" -gt 0 ] 2>/dev/null; then
-      # 原子写入 pending（消息已从服务端消费，必须落盘防丢）
-      tmp="$PENDING.tmp.$$"
-      printf '%s' "$out" > "$tmp"
-      mv "$tmp" "$PENDING"
-      log "received $cnt messages"
-      # Light the "typing..." indicator the moment the batch lands (owner
-      # only) instead of waiting for the worker agent to boot — the worker's
-      # own typing start then just acts as a keep-alive refresh.
-      owner=$(jq -r '.owner_id // empty' "$BRIDGE/owner.json" 2>/dev/null || true)
-      sender=$(printf '%s' "$out" | jq -r '.msgs[0].from_user_id // empty' 2>/dev/null || true)
-      if [ "$DRY" != "1" ] && [ -n "$owner" ] && [ "$sender" = "$owner" ]; then
-        python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" typing "$sender" start >/dev/null 2>&1 || true
+    commit_json=$(printf '%s' "$out" | jq -c '.commit // empty' 2>/dev/null || true)
+    # 提交本轮 poll（推进游标 + 记 seen）：只能在批次可靠落盘之后调用。
+    # 失败只记日志、不中断——下轮会重拉这批消息，宁可重复，绝不丢失。
+    do_commit() {
+      if [ "$DRY" != "1" ] && [ -n "$commit_json" ]; then
+        printf '%s' "$commit_json" | python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" commit >/dev/null 2>&1 \
+          || echo "[$(now)] COMMIT_FAILED" >> "$POLLLOG"
       fi
-      if [ "$DRY" != "1" ]; then
+    }
+    if [ "${cnt:-0}" -gt 0 ] 2>/dev/null; then
+      if [ "$DRY" = "1" ]; then
+        # dry 不落盘、不提交：消息留给正式轮询去拉，避免重复入队
+        silent "dry-run: $cnt messages fetched, left uncommitted for live poll"
+      else
+        # 原子写入 pending（只写 msgs，保持队列文件既有格式）
+        tmp="$PENDING.tmp.$$"
+        printf '%s' "$out" | jq -c '{msgs}' > "$tmp"
+        mv "$tmp" "$PENDING"
+        log "received $cnt messages"
+        # Light the "typing..." indicator the moment the batch lands (owner
+        # only) instead of waiting for the worker agent to boot — the worker's
+        # own typing start then just acts as a keep-alive refresh.
+        owner=$(jq -r '.owner_id // empty' "$BRIDGE/owner.json" 2>/dev/null || true)
+        sender=$(printf '%s' "$out" | jq -r '.msgs[0].from_user_id // empty' 2>/dev/null || true)
+        if [ -n "$owner" ] && [ "$sender" = "$owner" ]; then
+          python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" typing "$sender" start >/dev/null 2>&1 || true
+        fi
+        do_commit
         rec_extra=""
         if [ -n "$recovered" ]; then rec_extra=",\"recovered\":$recovered"; fi
         wake "new_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$rec_extra}"
-      else
-        silent "dry-run: $cnt messages saved to pending, no wake"
       fi
     elif [ -n "$recovered" ]; then
+      do_commit
       if [ "$DRY" != "1" ]; then
         wake "recovered" "$recovered"
       else
         silent "dry-run: would wake recovered"
       fi
     else
+      do_commit
       silent "no new messages"
     fi
   fi

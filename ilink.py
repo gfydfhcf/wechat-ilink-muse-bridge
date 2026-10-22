@@ -5,7 +5,8 @@ Usage:
   ilink.py qrcode              # get login QR, save image, print QR_CODE:<id>
   ilink.py status <qrcode>     # poll scan status once (JSON)
   ilink.py login <qrcode>      # poll until confirmed (up to 300s), save token
-  ilink.py poll                # fetch new messages since cursor (JSON)
+  ilink.py poll                # fetch new messages since cursor (JSON; two-phase: see commit)
+  ilink.py commit              # commit a poll round (commit block via stdin): cursor + seen ids
   ilink.py send <to> <ctx> <text>  # send text reply (use - for stdin)
   ilink.py proactive <to> <text>   # proactive push via cached context_token
   ilink.py typing <to> <start|stop>  # show/cancel the "typing..." indicator
@@ -215,11 +216,15 @@ def save_seen(ids):
 
 
 def filter_seen(raw_msgs):
-    """Drop raw messages whose message_id an earlier poll already delivered."""
-    if not any(m.get("message_id") is not None for m in raw_msgs):
-        return raw_msgs
-    seen = load_seen()
-    seen_set = set(seen)
+    """Split raw msgs into (kept, new_ids) by message_id — READ ONLY.
+
+    Ids are persisted by mark_seen() at commit time, after the caller
+    has durably queued the batch. Recording them here would lose
+    messages if the process died before queueing: the cursor would
+    already be advanced and the id marked, so the server would never
+    redeliver and a redelivery would be filtered out.
+    """
+    seen_set = set(load_seen())
     kept, new_ids = [], []
     for m in raw_msgs:
         mid = m.get("message_id")
@@ -230,9 +235,18 @@ def filter_seen(raw_msgs):
             seen_set.add(mid)
             new_ids.append(mid)
         kept.append(m)
-    if new_ids:
-        save_seen(seen + new_ids)
-    return kept
+    return kept, new_ids
+
+
+def mark_seen(ids):
+    """Persist message ids as delivered (the commit step of polling)."""
+    if not ids:
+        return
+    seen = load_seen()
+    have = set(seen)
+    merged = seen + [i for i in (str(x) for x in ids) if i not in have]
+    if len(merged) != len(seen):
+        save_seen(merged)
 
 
 def headers(token=None):
@@ -334,9 +348,10 @@ def cmd_poll():
         print("TOKEN_EXPIRED")
         return 2
     new_buf = data.get("get_updates_buf") or buf
+    fresh, new_ids = filter_seen(data.get("msgs") or [])
     msgs = []
     contacts = load_contacts()
-    for m in filter_seen(data.get("msgs") or []):
+    for m in fresh:
         if m.get("message_type") != 1:  # 只要用户发来的消息
             continue
         from_id = m.get("from_user_id")
@@ -375,9 +390,33 @@ def cmd_poll():
             msgs.append(entry)
     if contacts:
         save_contacts(contacts)
-    s["cursor"] = new_buf
-    save_session(s)
-    print(json.dumps({"msgs": msgs}, ensure_ascii=False))
+    # Two-phase commit: do NOT advance the cursor or record seen ids
+    # here. The caller (hook script / daemon) queues the batch durably,
+    # then submits the commit block below via `ilink.py commit`. A crash
+    # before that simply re-fetches the same batch next poll — messages
+    # may duplicate, but they are never lost.
+    print(json.dumps({"msgs": msgs,
+                      "commit": {"cursor": new_buf, "ids": new_ids}},
+                     ensure_ascii=False))
+    return 0
+
+
+def cmd_commit():
+    """Commit one poll round: advance the cursor + record delivered ids.
+    Reads the commit block from stdin: {"cursor": ..., "ids": [...]}.
+    Call only after the batch is durably queued. Idempotent."""
+    try:
+        payload = json.load(sys.stdin)
+    except Exception as e:
+        print(f"COMMIT_ERROR:bad stdin: {e}")
+        return 1
+    cursor = payload.get("cursor")
+    if cursor:
+        s = load_session()
+        s["cursor"] = cursor
+        save_session(s)
+    mark_seen(payload.get("ids") or [])
+    print("COMMIT_OK")
     return 0
 
 
@@ -835,6 +874,8 @@ if __name__ == "__main__":
         sys.exit(cmd_login(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 300))
     elif cmd == "poll":
         sys.exit(cmd_poll())
+    elif cmd == "commit":
+        sys.exit(cmd_commit())
     elif cmd == "health":
         sys.exit(cmd_health(offline="--offline" in sys.argv))
     elif cmd == "send":

@@ -49,6 +49,12 @@ def write_session(**kw):
 
 class HealthTest(unittest.TestCase):
     def setUp(self):
+        # Pin paths per-test: other modules in the suite pin them too.
+        ilink.BRIDGE = DATA_DIR
+        ilink.SESSION_FILE = os.path.join(DATA_DIR, "session.json")
+        ilink.CONTACTS_FILE = os.path.join(DATA_DIR, "contacts.json")
+        ilink.SEEN_FILE = os.path.join(DATA_DIR, "seen_ids.json")
+        os.environ["ILINK_HOOK_STATE_DIR"] = STATE_DIR
         for name in os.listdir(DATA_DIR):
             path = os.path.join(DATA_DIR, name)
             if os.path.isfile(path):

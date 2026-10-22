@@ -57,6 +57,16 @@ WeChat user ──message──> iLink server
   `stuck_alert` field. Recovery (re-scan / network back) clears the
   expiry marker automatically — the old never-clear behavior would
   have suppressed the *next* expiry notice; fixed.
+- **Delivery semantics: at-least-once.** Polling is two-phase:
+  `ilink.py poll` only fetches — it neither advances the cursor nor
+  records dedupe ids. The script durably writes the batch to the
+  pending queue first, then calls `ilink.py commit`. A crash anywhere
+  means the batch is simply re-fetched next round: a reply may
+  duplicate, but a message is never silently lost. Supporting rules:
+  stale-claim recycling only runs while the pending queue is empty
+  (it can never overwrite a newer batch), and empty/invalid poll
+  output is treated as a poll failure (a hard crash enters the alert
+  state machine instead of masquerading as "no new messages").
 
 Paths in the script are parameterized (`ILINK_DATA_DIR`, `ILINK_HOOK_STATE`,
 `ILINK_CLIENT`). `$HATCH_HOOK_RUNTIME` is provided by the Muse hook runtime;

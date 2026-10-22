@@ -52,9 +52,23 @@ def poll_once():
     if out.startswith("POLL_ERROR"):
         return "error", []
     try:
-        return "ok", json.loads(out).get("msgs") or []
+        data = json.loads(out)
     except ValueError:
         return "error", []
+    # Two-phase poll: submit the commit block now that the batch is in
+    # hand. If commit fails, the batch is simply re-fetched next round —
+    # duplicates are possible, loss is not.
+    commit = data.get("commit")
+    if commit:
+        try:
+            subprocess.run(
+                [sys.executable, os.path.join(HERE, "ilink.py"), "commit"],
+                input=json.dumps(commit), capture_output=True, text=True,
+                timeout=30,
+            )
+        except Exception:
+            pass
+    return "ok", data.get("msgs") or []
 
 
 def collect_burst(first_msgs):
