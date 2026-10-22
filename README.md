@@ -12,8 +12,9 @@
 仓库同时给出两种长轮询接法：独立 `daemon.py`，和生产在用的 Muse hook 方案。
 
 <p align="center">
-  <img src="docs/demo-chat.svg" alt="演示：连发合并、正在输入、发送图片" width="420">
-  <br><em>演示效果：连发消息合并回复、"正在输入"状态、发送图片/视频</em>
+  <img src="docs/demo-chat-1.jpg" alt="真实使用截图：日常对话与发送视频" width="300">
+  <img src="docs/demo-chat-2.jpg" alt="真实使用截图：课程推送与每日摘要" width="300">
+  <br><em>真实使用截图：每日推送、日常对话、发送视频（敏感信息已打码）</em>
 </p>
 
 ## 在 Muse 里快速部署

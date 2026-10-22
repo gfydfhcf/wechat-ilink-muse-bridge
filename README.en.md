@@ -15,8 +15,9 @@ have a minimal iLink client. The repo also ships two long-polling drivers:
 a standalone `daemon.py`, and the Muse hook setup used in production.
 
 <p align="center">
-  <img src="docs/demo-chat.svg" alt="Demo: burst merging, typing indicator, image sending" width="420">
-  <br><em>Demo: burst merging, the "typing…" indicator, and image/video sending</em>
+  <img src="docs/demo-chat-1.jpg" alt="Real usage: daily chat and video sending" width="300">
+  <img src="docs/demo-chat-2.jpg" alt="Real usage: class push and daily digest" width="300">
+  <br><em>Real usage screenshots: daily pushes, everyday chat, video sending (sensitive details redacted)</em>
 </p>
 
 ## Quick deploy inside Muse
