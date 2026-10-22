@@ -107,7 +107,10 @@ def _http_get_range(url, start=0, timeout=60):
 
 
 def download_media_item(item: dict, item_type: int):
-    """Download + AES-ECB decrypt an IMAGE/VOICE/FILE/VIDEO item. Returns saved path or None."""
+    """Download + AES-ECB decrypt an IMAGE/VOICE/FILE/VIDEO item. Returns saved path or None.
+    Diagnostics go to stderr only: poll's stdout is a machine-readable JSON
+    channel, and any extra line printed there corrupts the whole batch for
+    callers (hook jq / daemon json.loads) — regression-tested."""
     key = ITEM_KEY.get(item_type)
     if not key:
         return None
@@ -119,7 +122,7 @@ def download_media_item(item: dict, item_type: int):
         if aes_hex:
             aes_key_b64 = base64.b64encode(bytes.fromhex(aes_hex)).decode("ascii")
     if not aes_key_b64:
-        print(f"MEDIA_ERROR:no aes_key", flush=True)
+        print(f"MEDIA_ERROR:no aes_key", file=sys.stderr, flush=True)
         return None
     aes_key = _parse_aes_key(aes_key_b64)
     full_url = media.get("full_url")
@@ -130,7 +133,7 @@ def download_media_item(item: dict, item_type: int):
         from urllib.parse import quote
         url = f"{CDN_BASE_URL}/download?encrypted_query_param={quote(eqp, safe='')}"
     else:
-        print(f"MEDIA_ERROR:no download url", flush=True)
+        print(f"MEDIA_ERROR:no download url", file=sys.stderr, flush=True)
         return None
     ciphertext = b""
     total = None
@@ -154,10 +157,10 @@ def download_media_item(item: dict, item_type: int):
             break  # 无长度信息但一次读完，视为完成
         time.sleep(2 * (attempt + 1))
     if total is not None and len(ciphertext) < total:
-        print(f"MEDIA_ERROR:incomplete after retries {len(ciphertext)}/{total} last={last_err}", flush=True)
+        print(f"MEDIA_ERROR:incomplete after retries {len(ciphertext)}/{total} last={last_err}", file=sys.stderr, flush=True)
         return None
     if not ciphertext:
-        print(f"MEDIA_ERROR:empty download last={last_err}", flush=True)
+        print(f"MEDIA_ERROR:empty download last={last_err}", file=sys.stderr, flush=True)
         return None
     plaintext = _aes_ecb_decrypt(ciphertext, aes_key)
     ext = {2: "jpg", 3: "silk", 4: "bin", 5: "mp4"}.get(item_type, "bin")
@@ -369,7 +372,7 @@ def cmd_poll():
                 entry["text"] = (item.get("text_item") or {}).get("text", "")
             elif t == 3:  # VOICE: 可能带语音转写文本
                 entry["text"] = (item.get("voice_item") or {}).get("text", "")
-                entry["voice_duration_ms"] = (item.get("voice_item") or {}).get("voice_duration_ms", 0)
+                entry["voice_duration_ms"] = (item.get("voice_item") or {}).get("playtime", 0)
                 try:
                     p = download_media_item(item, t)
                     if p:

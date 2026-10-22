@@ -148,6 +148,18 @@ class HookIntegrationTest(unittest.TestCase):
         with open(os.path.join(self.bridge, "alert-state.json")) as f:
             self.assertIn("err_since", json.load(f))
 
+    def test_pending_wake_reports_real_message_count(self):
+        # Regression (2026-10-22 review): the pending branch counted with
+        # `jq 'length'`, which counts the queue object's KEYS (always 1),
+        # not the queued messages. The wake payload must carry the real
+        # message count.
+        pend_path = os.path.join(self.state, "ilink-pending.json")
+        with open(pend_path, "w") as f:
+            json.dump({"msgs": [{"from_user_id": "owner1", "message_id": n}
+                                  for n in (11, 12, 13)]}, f)
+        calls = self.run_hook()
+        self.assertIn('WAKE pending_wechat_messages {"count":3', calls)
+
 
 if __name__ == "__main__":
     unittest.main()

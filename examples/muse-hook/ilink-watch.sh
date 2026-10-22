@@ -67,7 +67,7 @@ fi
 
 # 有未处理的消息（上一轮拉到、agent 还没吃完）：直接 wake，不再拉新的
 if [ -s "$PENDING" ]; then
-  cnt=$(jq 'length' "$PENDING" 2>/dev/null || echo 0)
+  cnt=$(jq '.msgs | length' "$PENDING" 2>/dev/null || echo 0)
   if [ "$cnt" -gt 0 ] 2>/dev/null; then
     log "pending $cnt messages waiting"
     # Leftover batches also light the typing indicator immediately (owner only)
