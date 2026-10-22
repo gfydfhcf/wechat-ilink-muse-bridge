@@ -1,6 +1,9 @@
 # wechat-ilink-muse-bridge
 
 [![CI](https://github.com/gfydfhcf/wechat-ilink-muse-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/gfydfhcf/wechat-ilink-muse-bridge/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/gfydfhcf/wechat-ilink-muse-bridge)](https://github.com/gfydfhcf/wechat-ilink-muse-bridge/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 
 [中文](README.md) | [English](README.en.md)
 
