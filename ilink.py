@@ -14,6 +14,7 @@ Usage:
   ilink.py send-video <to> <ctx> <path>   # reply with a video
   ilink.py proactive-image <to> <path>    # proactive image via cached ctx
   ilink.py proactive-file <to> <path>     # proactive file via cached ctx
+  ilink.py health [--offline]  # self-check: auth, queue, last poll (exit 0 ok / 1 warn / 2 bad)
   ilink.py proactive-video <to> <path>    # proactive video via cached ctx
 """
 import base64
@@ -711,6 +712,121 @@ def cmd_proactive_media(to_user_id, path, media_type):
     return 0
 
 
+def _fmt_age(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{seconds // 60}m"
+    if seconds < 172800:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def cmd_health(offline=False):
+    """Self-check: auth, live token probe, message queue, last poll error.
+    Exit code 0 = healthy, 1 = warnings, 2 = broken."""
+    now = int(time.time())
+    lines, warnings, problems = [], [], []
+    s = load_session()
+    token = s.get("bot_token")
+    if not token:
+        problems.append("not logged in: no bot_token in session, QR login needed")
+    elif s.get("login_at"):
+        lines.append(f"auth: logged in (QR scanned {_fmt_age(now - s['login_at'])} ago)")
+    else:
+        lines.append("auth: logged in (login time unknown)")
+
+    owner = None
+    try:
+        with open(os.path.join(BRIDGE, "owner.json")) as f:
+            owner = json.load(f).get("owner_id")
+    except Exception:
+        pass
+
+    # Live probe: getconfig for a typing ticket — no side effects, does not
+    # touch the message cursor.
+    if token and not offline:
+        ctx = (load_contacts().get(owner) or {}).get("context_token") if owner else None
+        if not ctx:
+            lines.append("probe: skipped (no cached owner context_token)")
+        else:
+            try:
+                data = api("POST", "ilink/bot/getconfig",
+                           {"ilink_user_id": owner, "context_token": ctx,
+                            "base_info": {"channel_version": "1.0.2"}},
+                           token=token, timeout=12)
+                if data.get("typing_ticket"):
+                    lines.append("probe: token valid (getconfig OK)")
+                elif data.get("code") == -14:
+                    problems.append("token expired (getconfig code -14), re-scan needed")
+                else:
+                    warnings.append(f"probe result unclear: {str(data)[:80]}")
+            except Exception as e:
+                warnings.append(f"probe failed (network?): {type(e).__name__}")
+    elif token:
+        lines.append("probe: skipped (--offline)")
+
+    # Message queue (hook state dir; ILINK_HOOK_STATE_DIR overrides, for tests)
+    state_dir = os.environ.get("ILINK_HOOK_STATE_DIR",
+                               os.path.expanduser("~/hooks/state"))
+    pend = os.path.join(state_dir, "ilink-pending.json")
+    proc = os.path.join(state_dir, "ilink-processing.json")
+
+    def _queue_count(path):
+        try:
+            with open(path) as f:
+                return len(json.load(f).get("msgs") or [])
+        except Exception:
+            return 0
+
+    if os.path.exists(pend) and _queue_count(pend) > 0:
+        lines.append(f"queue: {_queue_count(pend)} message(s) pending")
+    else:
+        lines.append("queue: nothing pending")
+    if os.path.exists(proc):
+        claimed_age = now - int(os.stat(proc).st_ctime)  # ctime = claim time
+        if claimed_age > 600:
+            warnings.append(
+                f"processing claimed {_fmt_age(claimed_age)} ago, still not done "
+                "(worker may be stuck)")
+        else:
+            lines.append(f"queue: processing in flight ({_fmt_age(claimed_age)})")
+    else:
+        lines.append("queue: nothing processing")
+
+    try:
+        lines.append(f"dedupe: {len(load_seen())} message ids recorded")
+    except Exception:
+        pass
+
+    poll_log = os.path.join(BRIDGE, "poll.log")
+    if os.path.exists(poll_log):
+        try:
+            with open(poll_log) as f:
+                tail = [ln.strip() for ln in f if ln.strip()]
+            if tail:
+                lines.append(f"poll: last error {tail[-1][:90]}")
+        except Exception:
+            pass
+
+    for w in warnings:
+        lines.append(f"WARN: {w}")
+    for p in problems:
+        lines.append(f"BAD: {p}")
+    if problems:
+        lines.append("verdict: BAD")
+        print("\n".join(lines))
+        return 2
+    if warnings:
+        lines.append("verdict: WARNINGS")
+        print("\n".join(lines))
+        return 1
+    lines.append("verdict: OK")
+    print("\n".join(lines))
+    return 0
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "qrcode":
@@ -719,6 +835,8 @@ if __name__ == "__main__":
         sys.exit(cmd_login(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 300))
     elif cmd == "poll":
         sys.exit(cmd_poll())
+    elif cmd == "health":
+        sys.exit(cmd_health(offline="--offline" in sys.argv))
     elif cmd == "send":
         sys.exit(cmd_send(sys.argv[2], sys.argv[3], sys.argv[4]))
     elif cmd == "proactive":

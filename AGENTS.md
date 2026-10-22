@@ -45,6 +45,13 @@ atomic `mv`. When woken, handle the batch under this contract:
 - Never manually retry a failed send; the client already retries once with
   the same client_id.
 - On `token_expired`, tell the user once that a re-scan is needed.
+- The script also runs a closed alert loop (see
+  `examples/muse-hook/README.md`): an unfixed expiry is re-reported
+  hourly (`token_expired` with `repeat: true`), 10+ minutes of poll
+  failures wake you as `poll_failing`, recovery wakes you as
+  `recovered`, and a recycled stuck batch adds `stuck_alert` to the
+  message payload. Report each in one short line; never "make up" for
+  missed reminders.
 
 **Otherwise**: run `python3 daemon.py --echo` to verify the loop. For an
 LLM-backed bot, `python3 daemon.py --llm` is a ready-made example handler
@@ -62,12 +69,22 @@ test a proactive push:
 python3 ilink.py proactive <user_id> -   # text via stdin
 ```
 
+Any time something seems off, run the self-check before digging through
+logs — it covers auth age, a live token probe, queue backlog and the
+last poll error, with a 0/1/2 exit code:
+
+```bash
+python3 ilink.py health            # add --offline to skip the live probe
+```
+
 ## 4. Ongoing behavior
 
 - Session lifetime is unpredictable: early community reports suggested
   roughly 24h, but in production one login has stayed valid for 3+ days.
   When commands report `TOKEN_EXPIRED` / `NO_TOKEN`, ask the user to
-  re-scan — once, not repeatedly.
+  re-scan. With the hook driver, the script's alert loop handles the
+  cadence (first notice, hourly repeats, recovery announcement) — don't
+  nag on your own schedule on top of it.
 - The bot only receives messages sent **to the bot**. It cannot read the
   user's main-account chats, contacts, or Moments; the protocol has no
   such endpoints. Do not promise otherwise.

@@ -3,6 +3,13 @@
 # 每一轮脚本运行 = 一次 getupdates 长轮询（服务端 hold 最多 35s，有消息立刻返回）。
 # 有新消息 -> 写入 pending 队列并 wake，由 worker agent 生成回复；
 # 无消息/出错 -> silent。
+# 告警闭环（alert-state.json 状态机）：
+#   - token 过期：首次立即 wake 报一次，之后每小时复报一次（payload 带 repeat/hours）
+#   - 轮询连续失败：满 10 分钟才报（防抖动误报），之后每小时复报一次
+#   - 恢复：曾告警过的异常恢复正常后 wake 一次 recovered（报好不只报坏）；
+#     短暂抖动未告警的静默清除状态
+#   - worker 卡住：processing 超 10 分钟被回收时记 stuck 起点，积压超 10 分钟
+#     随 pending 的 wake 带 stuck_alert（每小时至多一次）
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -15,9 +22,24 @@ PENDING=$STATE_DIR/ilink-pending.json
 PROC=$STATE_DIR/ilink-processing.json
 RESCAN=$BRIDGE/rescan_notified
 POLLLOG=$BRIDGE/poll.log
+ALERT=$BRIDGE/alert-state.json
 DRY=${HATCH_HOOK_DRY_RUN:-0}
+NOW=$(date +%s)
 
 now() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# 告警状态读写（jq，原子写；dry-run 不写状态，保持纯净）
+astate() { jq -r ".$1 // 0" "$ALERT" 2>/dev/null || echo 0; }
+aset() {
+  [ "$DRY" = "1" ] && return 0
+  local tmp="$ALERT.tmp.$$"
+  if [ -f "$ALERT" ]; then
+    jq --argjson v "$2" ".$1 = \$v" "$ALERT" > "$tmp" 2>/dev/null || echo '{}' > "$tmp"
+  else
+    jq -n --argjson v "$2" "{\"$1\": \$v}" > "$tmp" 2>/dev/null || echo '{}' > "$tmp"
+  fi
+  mv "$tmp" "$ALERT" 2>/dev/null || true
+}
 
 # 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
 # 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
@@ -28,6 +50,10 @@ now() { date '+%Y-%m-%d %H:%M:%S'; }
 if [ -f "$PROC" ] && [ -n "$(find "$PROC" -cmin +10 2>/dev/null || true)" ]; then
   mv "$PROC" "$PENDING"
   log "recovered stale processing file to pending"
+  # 卡住计时：能被回收说明这一轮处理至少已卡了 10 分钟，起点回拨 600 秒
+  if [ "$(astate stuck_since)" -eq 0 ]; then
+    aset stuck_since $((NOW - 600))
+  fi
 fi
 
 # 有未处理的消息（上一轮拉到、agent 还没吃完）：直接 wake，不再拉新的
@@ -41,7 +67,16 @@ if [ -s "$PENDING" ]; then
     if [ -n "$owner" ] && [ "$sender" = "$owner" ]; then
       python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" typing "$sender" start >/dev/null 2>&1 || true
     fi
-    wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"}"
+    # 卡住告警：积压起点距今 >=10 分钟且距上次告警 >=1 小时，随 wake 带出
+    extra=""
+    stuck_since=$(astate stuck_since)
+    stuck_last=$(astate stuck_last)
+    if [ "$stuck_since" -gt 0 ] && [ $((NOW - stuck_since)) -ge 600 ] \
+       && [ $((NOW - stuck_last)) -ge 3600 ]; then
+      aset stuck_last "$NOW"
+      extra=",\"stuck_alert\":true,\"stuck_minutes\":$(( (NOW - stuck_since) / 60 ))"
+    fi
+    wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$extra}"
   else
     silent "pending file empty"
   fi
@@ -51,22 +86,73 @@ else
   out=$(python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" poll 2>/dev/null || true)
 
   if [[ "$out" == NO_TOKEN* ]] || [[ "$out" == TOKEN_EXPIRED* ]]; then
-    if [ ! -e "$RESCAN" ]; then
+    exp_since=$(astate exp_since)
+    exp_last=$(astate exp_last)
+    if [ "$exp_since" -eq 0 ]; then
+      # 首次过期：立即报一次（rescan_notified 标记保留作兼容，成功轮询时清除）
+      aset exp_since "$NOW"
+      aset exp_last "$NOW"
       if [ "$DRY" != "1" ]; then
         touch "$RESCAN"
         wake "token_expired" "{}"
       else
-        silent "dry-run: would create rescan marker and wake token_expired"
+        silent "dry-run: would set expiry state and wake token_expired"
+      fi
+    elif [ $((NOW - exp_last)) -ge 3600 ]; then
+      # 长时间未恢复：每小时复报一次
+      aset exp_last "$NOW"
+      if [ "$DRY" != "1" ]; then
+        wake "token_expired" "{\"repeat\":true,\"hours\":$(( (NOW - exp_since) / 3600 ))}"
+      else
+        silent "dry-run: would repeat token_expired alert"
       fi
     else
-      silent "token expired already notified"
+      silent "token expired, repeat alert throttled"
     fi
   elif [[ "$out" == POLL_ERROR* ]]; then
     if [ "$DRY" != "1" ]; then
       echo "[$(now)] $out" >> "$POLLLOG"
     fi
-    silent "poll error"
+    err_since=$(astate err_since)
+    if [ "$err_since" -eq 0 ]; then
+      aset err_since "$NOW"
+      err_since=$NOW
+    fi
+    err_last=$(astate err_last)
+    err_dur=$((NOW - err_since))
+    if [ "$err_dur" -ge 600 ] && { [ "$err_last" -eq 0 ] || [ $((NOW - err_last)) -ge 3600 ]; }; then
+      # 连续失败满 10 分钟才报（抖动通常几分钟内自愈），之后每小时复报
+      aset err_last "$NOW"
+      if [ "$DRY" != "1" ]; then
+        wake "poll_failing" "{\"minutes\":$((err_dur / 60))}"
+      else
+        silent "dry-run: would wake poll_failing"
+      fi
+    else
+      silent "poll error"
+    fi
   else
+    # 轮询成功：先做恢复记账（曾告警过的异常恢复了要报平安）
+    recovered=""
+    exp_since=$(astate exp_since)
+    err_since=$(astate err_since)
+    # 卡住事件收尾：队列已排空（无 pending 才进本分支）且无人处理中，清状态
+    if [ ! -f "$PROC" ] && [ "$(astate stuck_since)" -gt 0 ]; then
+      aset stuck_since 0
+      aset stuck_last 0
+    fi
+    if [ "$exp_since" -gt 0 ]; then
+      recovered="{\"kind\":\"token\",\"minutes\":$(( (NOW - exp_since) / 60 ))}"
+      aset exp_since 0
+      aset exp_last 0
+      if [ "$DRY" != "1" ]; then rm -f "$RESCAN"; fi
+    elif [ "$err_since" -gt 0 ]; then
+      if [ "$(astate err_last)" -gt 0 ]; then
+        recovered="{\"kind\":\"poll_error\",\"minutes\":$(( (NOW - err_since) / 60 ))}"
+      fi
+      aset err_since 0
+      aset err_last 0
+    fi
     cnt=$(printf '%s' "$out" | jq '[.msgs[]?] | length' 2>/dev/null || echo 0)
     if [ "${cnt:-0}" -gt 0 ] 2>/dev/null; then
       # 原子写入 pending（消息已从服务端消费，必须落盘防丢）
@@ -83,9 +169,17 @@ else
         python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" typing "$sender" start >/dev/null 2>&1 || true
       fi
       if [ "$DRY" != "1" ]; then
-        wake "new_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"}"
+        rec_extra=""
+        if [ -n "$recovered" ]; then rec_extra=",\"recovered\":$recovered"; fi
+        wake "new_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$rec_extra}"
       else
         silent "dry-run: $cnt messages saved to pending, no wake"
+      fi
+    elif [ -n "$recovered" ]; then
+      if [ "$DRY" != "1" ]; then
+        wake "recovered" "$recovered"
+      else
+        silent "dry-run: would wake recovered"
       fi
     else
       silent "no new messages"

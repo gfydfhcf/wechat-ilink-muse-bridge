@@ -48,6 +48,15 @@ WeChat user ──message──> iLink server
 - **Token expiry nags once**: when the script sees `TOKEN_EXPIRED` it
   creates a `rescan_notified` marker and wakes the agent to ask the user
   to re-scan; while the marker exists, it never nags again.
+- **Closed-loop alerting** (an `alert-state.json` state machine): an
+  expiry left unfixed is re-reported hourly; poll failures alert only
+  after 10 continuous minutes (so network jitter never cries wolf),
+  then hourly; when an alerted problem recovers, the agent wakes once
+  to say it's back (un-alerted blips clear silently); when a worker's
+  claim times out and is recycled, the pending wake carries a
+  `stuck_alert` field. Recovery (re-scan / network back) clears the
+  expiry marker automatically — the old never-clear behavior would
+  have suppressed the *next* expiry notice; fixed.
 
 Paths in the script are parameterized (`ILINK_DATA_DIR`, `ILINK_HOOK_STATE`,
 `ILINK_CLIENT`). `$HATCH_HOOK_RUNTIME` is provided by the Muse hook runtime;

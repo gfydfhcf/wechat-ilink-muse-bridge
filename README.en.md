@@ -65,6 +65,13 @@ repo root — you only need to pick up WeChat once, at the QR-scan step.
 - **Inbound dedupe** — the server occasionally redelivers the same message;
   poll filters by `message_id` (last 500 persisted to disk), so one message
   never gets two replies
+- **Closed-loop alerting** — bad news *and* good news: token expiry is
+  reported once, then hourly; poll failures alert only after 10 continuous
+  minutes (no crying wolf over jitter); recovery gets announced; a worker
+  stuck for 10+ minutes has its queue recycled and flagged
+- **health self-check** — `ilink.py health` shows login age, a live token
+  probe, queue backlog and the last poll error in one command, with
+  exit codes 0/1/2 for monitoring
 - **Token expiry nags once** — on expiry a marker file is written and the
   user is asked to re-scan exactly once
 

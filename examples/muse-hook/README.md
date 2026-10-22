@@ -37,6 +37,12 @@
   typing 指示，不等 worker 冷启动；worker 侧的点亮只作续期。
 - **token 过期只通知一次**：脚本发现 `TOKEN_EXPIRED` 时创建
   `rescan_notified` 标记并唤醒 agent 通知用户重扫；标记在就不再打扰。
+- **告警闭环**（`alert-state.json` 状态机）：过期超过 1 小时每小时复报
+  一次；轮询连续失败满 10 分钟才告警（防网络抖动误报）、之后每小时
+  复报；曾告警的异常恢复后唤醒 agent 报一句平安（短暂抖动未告警的
+  静默清除）；worker 处理超时被回收后，积压的 wake 会带 `stuck_alert`
+  字段。恢复（重新扫码/网络恢复）时自动清除过期标记——旧版标记永不
+  清除会导致下一次过期不再通知，已修复。
 
 脚本里的路径已参数化（`ILINK_DATA_DIR`、`ILINK_HOOK_STATE`、`ILINK_CLIENT`），
 `$HATCH_HOOK_RUNTIME` 是 Muse hook 运行时提供的环境，非 Muse 环境请用
