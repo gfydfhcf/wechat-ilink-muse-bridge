@@ -11,6 +11,11 @@
 核心客户端 `ilink.py` 不依赖任何框架，单独拿走就是一个极简 iLink 客户端；
 仓库同时给出两种长轮询接法：独立 `daemon.py`，和生产在用的 Muse hook 方案。
 
+<p align="center">
+  <img src="docs/demo-chat.svg" alt="演示：连发合并、正在输入、发送图片" width="420">
+  <br><em>演示效果：连发消息合并回复、"正在输入"状态、发送图片/视频</em>
+</p>
+
 ## 在 Muse 里快速部署
 
 把这句话发给你的 Muse：
@@ -31,8 +36,8 @@
   **发送前复查**：回复组织好、真正发出之前再看一眼有没有新消息进来，
   有就合并成一轮、按最新上下文回，只回一条。**调研过的所有同类 SDK
   都不做这个**，直接逐条回复的机器人会显得很机械，还会慢一拍答非所问
-- **发送图片/文件** — 走 `getuploadurl` 申请上传 → AES-128-ECB 加密 →
-  CDN 上传 → `sendmessage` 带媒体 item，图片和文件都支持（回复和主动
+- **发送图片/文件/视频** — 走 `getuploadurl` 申请上传 → AES-128-ECB 加密 →
+  CDN 上传 → `sendmessage` 带媒体 item，图片、文件、视频都支持（回复和主动
   推送两种模式）。协议细节有坑（两处枚举/编码不一致），代码里有注释
 - **"正在输入"状态** — 回复生成期间自动亮起 typing 指示
   （`getconfig` 取 `typing_ticket` + `sendtyping` 开关，票据缓存 9 分钟），
@@ -43,6 +48,8 @@
   续传 + 指数退避重试（弱网下整图重下经常死在 90%）
 - **发送防重复** — 发送失败绝不手动重试（服务端偶尔收了消息却不回
   回执，盲目重试 = 用户收到两条）
+- **入站去重** — 服务端偶尔会重复投递同一条消息；poll 按 `message_id`
+  过滤（最近 500 条落盘记录），同一条消息不会被回复两遍
 - **token 过期只吵一次** — 过期后落一个标记文件，只通知用户重扫一次
 
 ## 和同类项目的区别
@@ -100,6 +107,14 @@ LLM_API_KEY=sk-... python3 daemon.py --llm
 ```
 
 `--llm` 是示例 handler：带每用户最近 10 条上下文、纯标准库实现。需要工具调用/长期记忆的 Agent 接法见 `examples/muse-hook/`。
+
+或者用 Docker 一键部署（登录态和媒体都存在 `./data` 卷里）：
+
+```bash
+docker compose run --rm bot python3 ilink.py qrcode        # 扫码登录一次
+docker compose run --rm bot python3 ilink.py login <qrcode-id>
+docker compose up -d                                        # 默认 --echo 模式
+```
 
 单条命令速查：
 

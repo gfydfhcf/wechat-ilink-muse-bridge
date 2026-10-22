@@ -14,6 +14,11 @@ The core client `ilink.py` is framework-free — lift it out on its own and you
 have a minimal iLink client. The repo also ships two long-polling drivers:
 a standalone `daemon.py`, and the Muse hook setup used in production.
 
+<p align="center">
+  <img src="docs/demo-chat.svg" alt="Demo: burst merging, typing indicator, image sending" width="420">
+  <br><em>Demo: burst merging, the "typing…" indicator, and image/video sending</em>
+</p>
+
 ## Quick deploy inside Muse
 
 Send this sentence to your Muse:
@@ -40,8 +45,8 @@ repo root — you only need to pick up WeChat once, at the QR-scan step.
   in context — one reply per burst. **None of the SDKs we surveyed do this**;
   bots that answer message-by-message feel mechanical and reply to stale
   context
-- **Send images & files** — `getuploadurl` → AES-128-ECB encryption → CDN
-  upload → `sendmessage` with a media item. Images and files are both
+- **Send images, files & videos** — `getuploadurl` → AES-128-ECB encryption → CDN
+  upload → `sendmessage` with a media item. Images, files and videos are
   supported, in reply mode and proactive mode. The protocol has traps
   (two enum/encoding mismatches); they are documented in code comments
 - **"Typing…" indicator** — lights up while a reply is being composed
@@ -56,6 +61,9 @@ repo root — you only need to pick up WeChat once, at the QR-scan step.
 - **No duplicate sends** — a failed send is never blindly retried (the server
   occasionally accepts a message but drops the receipt; a blind retry means
   the user gets two copies)
+- **Inbound dedupe** — the server occasionally redelivers the same message;
+  poll filters by `message_id` (last 500 persisted to disk), so one message
+  never gets two replies
 - **Token expiry nags once** — on expiry a marker file is written and the
   user is asked to re-scan exactly once
 
@@ -124,6 +132,14 @@ LLM_API_KEY=sk-... python3 daemon.py --llm
 `--llm` is an example handler: per-user context of the last 10 messages,
 stdlib only. For an agent setup with tools and long-term memory, see
 `examples/muse-hook/`.
+
+Or deploy with Docker (session and media persist in the `./data` volume):
+
+```bash
+docker compose run --rm bot python3 ilink.py qrcode        # QR login, once
+docker compose run --rm bot python3 ilink.py login <qrcode-id>
+docker compose up -d                                       # --echo by default
+```
 
 Command cheat sheet:
 
