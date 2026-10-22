@@ -1,0 +1,21 @@
+# One-command deployment:
+#   1. docker compose run --rm bot python3 ilink.py qrcode   # prints QR path
+#      docker compose run --rm bot python3 ilink.py login <qrcode-id>
+#   2. docker compose up -d
+# The session and downloaded media persist in ./data (the bot's login
+# credential — keep it private, never commit it).
+services:
+  bot:
+    build: .
+    environment:
+      ILINK_DATA_DIR: /data
+      # For --llm mode, uncomment and fill in:
+      # LLM_API_KEY: sk-...
+      # LLM_BASE_URL: https://api.openai.com/v1
+      # LLM_MODEL: gpt-4o-mini
+    volumes:
+      - ./data:/data
+    # --echo demos the loop; switch to --llm for the LLM example handler,
+    # or drop the flag to only log incoming bursts.
+    command: ["python3", "daemon.py", "--echo"]
+    restart: unless-stopped
