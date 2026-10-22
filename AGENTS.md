@@ -37,9 +37,13 @@ atomic `mv`. When woken, handle the batch under this contract:
   crash recovery judges staleness by file timestamps, and `mv` preserves
   the message-arrival time — an un-refreshed claim can be mistaken for a
   stale one and bounced back to pending.
-- One reply per burst: before sending, re-check the pending file; if newer
-  messages arrived while you composed, merge them and re-compose against
-  the newest context (max 3 rounds).
+- One composed response per burst: before sending, re-check the
+  pending file; if newer messages arrived while you composed, merge
+  them and re-compose against the newest context (max 3 rounds).
+  Delivery may split into 2–3 short bubbles sent back-to-back when
+  the content naturally segments (a reaction, the substance, a
+  question) — like a human texting — but never one reply per incoming
+  message, and never split a single sentence across bubbles.
 - The script already lit the "typing…" indicator on arrival; refresh it if
   composing takes >30s and stop it after sending.
 - Read what the user actually sent: image entries carry a downloaded
