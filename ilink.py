@@ -37,6 +37,7 @@ os.makedirs(BRIDGE, exist_ok=True)
 os.makedirs(os.path.join(BRIDGE, "media"), exist_ok=True)
 SESSION_FILE = os.path.join(BRIDGE, "session.json")
 CONTACTS_FILE = os.path.join(BRIDGE, "contacts.json")  # from_user_id -> {context_token, updated_at}
+SEEN_FILE = os.path.join(BRIDGE, "seen_ids.json")  # delivered inbound message_ids (dedupe)
 MEDIA_DIR = os.path.join(BRIDGE, "media")
 CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 
@@ -184,6 +185,55 @@ def save_contacts(c):
     os.replace(tmp, CONTACTS_FILE)
 
 
+# --- Inbound dedupe ---------------------------------------------------------
+# getupdates occasionally redelivers the same message (e.g. a response lost
+# after the cursor advanced). Processing one message_id twice means the
+# user gets two replies. poll is the only inbound path, so filter here and
+# both drivers (hook and daemon) are protected. An id is recorded as seen
+# when poll returns it — the same semantics as the cursor advancing
+# (delivered = returned by poll). Messages without a message_id cannot be
+# deduped and pass through.
+SEEN_CAP = 500  # keep the most recent 500 ids; older ones roll off
+
+def load_seen():
+    try:
+        with open(SEEN_FILE) as f:
+            ids = json.load(f)
+        return ids if isinstance(ids, list) else []
+    except Exception:
+        return []
+
+
+def save_seen(ids):
+    os.makedirs(BRIDGE, exist_ok=True)
+    tmp = SEEN_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(ids[-SEEN_CAP:], f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SEEN_FILE)
+
+
+def filter_seen(raw_msgs):
+    """Drop raw messages whose message_id an earlier poll already delivered."""
+    if not any(m.get("message_id") is not None for m in raw_msgs):
+        return raw_msgs
+    seen = load_seen()
+    seen_set = set(seen)
+    kept, new_ids = [], []
+    for m in raw_msgs:
+        mid = m.get("message_id")
+        if mid is not None:
+            mid = str(mid)
+            if mid in seen_set:
+                continue
+            seen_set.add(mid)
+            new_ids.append(mid)
+        kept.append(m)
+    if new_ids:
+        save_seen(seen + new_ids)
+    return kept
+
+
 def headers(token=None):
     uin = str(random.randint(0, 0xFFFFFFFF))
     h = {
@@ -285,7 +335,7 @@ def cmd_poll():
     new_buf = data.get("get_updates_buf") or buf
     msgs = []
     contacts = load_contacts()
-    for m in data.get("msgs") or []:
+    for m in filter_seen(data.get("msgs") or []):
         if m.get("message_type") != 1:  # 只要用户发来的消息
             continue
         from_id = m.get("from_user_id")
@@ -295,7 +345,8 @@ def cmd_poll():
         for item in m.get("item_list") or []:
             t = item.get("type") or 0
             kind = ITEM_TYPE_NAMES.get(t, f"unknown_{t}")
-            entry = {"from_user_id": from_id, "context_token": ctx, "kind": kind}
+            entry = {"from_user_id": from_id, "context_token": ctx, "kind": kind,
+                     "message_id": m.get("message_id")}
             if t == 1:  # TEXT
                 entry["text"] = (item.get("text_item") or {}).get("text", "")
             elif t == 3:  # VOICE: 可能带语音转写文本
