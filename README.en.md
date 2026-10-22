@@ -173,6 +173,17 @@ The data directory defaults to `./data/` and can be overridden with the
 
 ## Known limitations (the fine print, up front)
 
+- **Outbound voice bubbles don't work (upstream limitation, awaiting
+  official support)**: the bot can *receive* voice messages (with WeChat's
+  transcript attached), but *sending* them is silently dropped server-side
+  by the iLink channel — the API returns success, yet the message never
+  renders in the client. Reproduced by this project and several
+  independent SDKs. This is a limitation of Tencent's channel, not of
+  this implementation; it has been requested in Tencent's official repo
+  (Tencent/openclaw-weixin #91, #282) and remains unimplemented. A
+  complete `send-voice` implementation (full SILK pipeline) ships in
+  this repo and will start working the moment the channel allows it.
+  Until then, audio can still be delivered as a file or video message.
 - **Session lifetime is uncertain**: early community reports suggested
   roughly 24 hours, but in production a single login here has stayed valid
   for 3+ days (Oct 2026); it may vary by account. Expiry means a human has
