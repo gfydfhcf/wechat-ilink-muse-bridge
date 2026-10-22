@@ -1,5 +1,7 @@
 # wechat-ilink-muse-bridge
 
+[![CI](https://github.com/gfydfhcf/wechat-ilink-muse-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/gfydfhcf/wechat-ilink-muse-bridge/actions/workflows/ci.yml)
+
 [中文](README.md) | [English](README.en.md)
 
 **Bring Muse (Meta's personal AI assistant) into WeChat.**
