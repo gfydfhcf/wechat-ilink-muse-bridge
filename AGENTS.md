@@ -42,6 +42,13 @@ atomic `mv`. When woken, handle the batch under this contract:
   the newest context (max 3 rounds).
 - The script already lit the "typing…" indicator on arrival; refresh it if
   composing takes >30s and stop it after sending.
+- Read what the user actually sent: image entries carry a downloaded
+  `media_path` — look at the picture; file entries also carry a
+  downloaded `media_path` (plus `file_name`) — open and read the
+  document (PDF/Office/text/code) and answer from its contents instead
+  of claiming you cannot open files. Only say so when the download
+  failed (`media_error`) or the format is truly unreadable; video
+  contents remain out of reach.
 - Never manually retry a failed send; the client already retries once with
   the same client_id.
 - On `token_expired`, tell the user once that a re-scan is needed.

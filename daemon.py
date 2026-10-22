@@ -128,10 +128,12 @@ def handle_burst(msgs, echo=False, llm=False):
 # Works with OpenAI itself, DeepSeek, Qwen (DashScope compatible mode),
 # Moonshot, a local Ollama (LLM_BASE_URL=http://localhost:11434/v1,
 # LLM_API_KEY can be any string), etc. Stdlib only — no extra dependency.
-# Per-user history is kept in memory (last LLM_HISTORY messages); restart
-# the daemon and the conversation starts fresh. Swap this function out for
-# your own agent call if you need tools/memory — that is what the Muse
-# hook setup in examples/muse-hook/ does.
+# Per-user history (last LLM_HISTORY messages) is persisted to
+# llm_history.json in the data dir, so a daemon restart continues the
+# conversation instead of starting fresh; delete that file to reset.
+# Swap this function out for your own agent call if you need real
+# tools/memory — that is what the Muse hook setup in
+# examples/muse-hook/ does.
 # ---------------------------------------------------------------------------
 
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
@@ -141,12 +143,39 @@ LLM_SYSTEM_PROMPT = os.environ.get(
     "LLM_SYSTEM_PROMPT", "你是一个微信聊天助手，回复简短、口语化，用中文。"
 )
 LLM_HISTORY = 10  # messages per user kept as context
-_history = {}
+DATA_DIR = os.environ.get("ILINK_DATA_DIR", "./data")
+HISTORY_FILE = os.path.join(DATA_DIR, "llm_history.json")
+_history = None  # loaded lazily from HISTORY_FILE on first use
+
+
+def _load_history():
+    global _history
+    if _history is None:
+        try:
+            with open(HISTORY_FILE) as f:
+                data = json.load(f)
+            _history = data if isinstance(data, dict) else {}
+        except Exception:
+            _history = {}  # missing or corrupt: start fresh, never crash
+    return _history
+
+
+def _save_history():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = HISTORY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_history, f, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, HISTORY_FILE)
+    except Exception as e:
+        print(f"[llm] could not persist history: {e}", flush=True)
 
 
 def llm_reply(user, text):
     """Send one user turn to the LLM and return its reply text."""
-    hist = _history.setdefault(user, [])
+    history = _load_history()
+    hist = history.setdefault(user, [])
     messages = (
         [{"role": "system", "content": LLM_SYSTEM_PROMPT}]
         + hist
@@ -172,7 +201,8 @@ def llm_reply(user, text):
         {"role": "user", "content": text},
         {"role": "assistant", "content": reply},
     ]
-    _history[user] = hist[-LLM_HISTORY:]
+    history[user] = hist[-LLM_HISTORY:]
+    _save_history()
     return reply
 
 
