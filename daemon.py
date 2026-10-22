@@ -17,16 +17,24 @@ Usage:
   python3 ilink.py qrcode && python3 ilink.py login <qrcode>   # once
   python3 daemon.py              # log incoming bursts, reply nothing
   python3 daemon.py --echo       # reply once per burst (demo handler)
+  python3 daemon.py --llm        # reply with an LLM (example handler)
 
 Environment:
   MERGE_WINDOW   seconds to keep collecting a burst (default 25)
   ILINK_DATA_DIR data dir forwarded to ilink.py (default ./data)
+  LLM_API_KEY    API key for --llm mode (required there)
+  LLM_BASE_URL   OpenAI-compatible base URL (default https://api.openai.com/v1)
+  LLM_MODEL      model name (default gpt-4o-mini)
+  LLM_SYSTEM_PROMPT  system prompt for --llm mode (default: a brief
+                 Chinese assistant persona)
 """
 import json
 import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MERGE_WINDOW = float(os.environ.get("MERGE_WINDOW", "25"))
@@ -76,7 +84,7 @@ def _typing(user, word):
         pass
 
 
-def handle_burst(msgs, echo=False):
+def handle_burst(msgs, echo=False, llm=False):
     """One user turn. Replace this with your own agent/LLM call."""
     by_user = {}
     for m in msgs:
@@ -84,21 +92,87 @@ def handle_burst(msgs, echo=False):
     for user, items in by_user.items():
         texts = [i.get("text") or f"[{i.get('kind')}]" for i in items]
         print(f"[{time.strftime('%H:%M:%S')}] {user}: " + " / ".join(texts), flush=True)
-        if echo:
-            ctx = items[-1]["context_token"]  # always reply with the latest ctx
+        if not (echo or llm):
+            continue
+        ctx = items[-1]["context_token"]  # always reply with the latest ctx
+        if llm:
+            reply = llm_reply(user, " ".join(texts))
+        else:
             reply = "收到：" + " ".join(texts)
-            _typing(user, "start")  # show "typing..." while the reply goes out
-            try:
-                subprocess.run(
-                    [sys.executable, os.path.join(HERE, "ilink.py"), "send", user, ctx, "-"],
-                    input=reply, text=True, timeout=120,
-                )
-            finally:
-                _typing(user, "stop")
+        _typing(user, "start")  # show "typing..." while the reply goes out
+        try:
+            subprocess.run(
+                [sys.executable, os.path.join(HERE, "ilink.py"), "send", user, ctx, "-"],
+                input=reply, text=True, timeout=120,
+            )
+        finally:
+            _typing(user, "stop")
+
+
+# ---------------------------------------------------------------------------
+# Example LLM handler (--llm): any OpenAI-compatible chat-completions API.
+# Works with OpenAI itself, DeepSeek, Qwen (DashScope compatible mode),
+# Moonshot, a local Ollama (LLM_BASE_URL=http://localhost:11434/v1,
+# LLM_API_KEY can be any string), etc. Stdlib only — no extra dependency.
+# Per-user history is kept in memory (last LLM_HISTORY messages); restart
+# the daemon and the conversation starts fresh. Swap this function out for
+# your own agent call if you need tools/memory — that is what the Muse
+# hook setup in examples/muse-hook/ does.
+# ---------------------------------------------------------------------------
+
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+LLM_SYSTEM_PROMPT = os.environ.get(
+    "LLM_SYSTEM_PROMPT", "你是一个微信聊天助手，回复简短、口语化，用中文。"
+)
+LLM_HISTORY = 10  # messages per user kept as context
+_history = {}
+
+
+def llm_reply(user, text):
+    """Send one user turn to the LLM and return its reply text."""
+    hist = _history.setdefault(user, [])
+    messages = (
+        [{"role": "system", "content": LLM_SYSTEM_PROMPT}]
+        + hist
+        + [{"role": "user", "content": text}]
+    )
+    req = urllib.request.Request(
+        LLM_BASE_URL + "/chat/completions",
+        data=json.dumps({"model": LLM_MODEL, "messages": messages}).encode(),
+        headers={
+            "Authorization": f"Bearer {LLM_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        reply = data["choices"][0]["message"]["content"].strip()
+    except Exception as e:  # network error, bad key, unexpected payload...
+        print(f"[llm] request failed: {e}", flush=True)
+        return "（LLM 调用失败，看一下 daemon 的日志）"
+    hist += [
+        {"role": "user", "content": text},
+        {"role": "assistant", "content": reply},
+    ]
+    _history[user] = hist[-LLM_HISTORY:]
+    return reply
 
 
 def main():
-    echo = "--echo" in sys.argv
+    llm = "--llm" in sys.argv
+    echo = "--echo" in sys.argv and not llm
+    if llm and not LLM_API_KEY:
+        print(
+            "LLM_API_KEY is not set. Example:\n"
+            "  LLM_API_KEY=sk-... python3 daemon.py --llm\n"
+            "Optional: LLM_BASE_URL, LLM_MODEL, LLM_SYSTEM_PROMPT (see docstring).",
+            flush=True,
+        )
+        sys.exit(1)
     backoff = 1
     noticed_expired = False
     print("long-poll daemon started (Ctrl+C to stop)", flush=True)
@@ -116,7 +190,7 @@ def main():
             continue
         backoff = 1
         if msgs:
-            handle_burst(collect_burst(msgs), echo=echo)
+            handle_burst(collect_burst(msgs), echo=echo, llm=llm)
 
 
 if __name__ == "__main__":

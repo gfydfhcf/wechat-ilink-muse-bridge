@@ -92,6 +92,15 @@ python3 daemon.py --echo
 # 之后给机器人发条微信试试——连发两条，只会收到一条合并回复
 ```
 
+想让回复来自大模型（OpenAI 兼容接口，OpenAI / DeepSeek / 通义 / Moonshot / 本地 Ollama 都行），换 `--llm` 模式，配置走环境变量：
+
+```bash
+LLM_API_KEY=sk-... python3 daemon.py --llm
+# 可选：LLM_BASE_URL（默认 https://api.openai.com/v1）、LLM_MODEL（默认 gpt-4o-mini）、LLM_SYSTEM_PROMPT
+```
+
+`--llm` 是示例 handler：带每用户最近 10 条上下文、纯标准库实现。需要工具调用/长期记忆的 Agent 接法见 `examples/muse-hook/`。
+
 单条命令速查：
 
 ```bash

@@ -46,8 +46,11 @@ atomic `mv`. When woken, handle the batch under this contract:
   the same client_id.
 - On `token_expired`, tell the user once that a re-scan is needed.
 
-**Otherwise**: run `python3 daemon.py --echo` to verify the loop, then
-replace the echo handler with your own reply logic (see `daemon.py`).
+**Otherwise**: run `python3 daemon.py --echo` to verify the loop. For an
+LLM-backed bot, `python3 daemon.py --llm` is a ready-made example handler
+for any OpenAI-compatible API (config via `LLM_API_KEY` / `LLM_BASE_URL` /
+`LLM_MODEL` env vars); replace it with your own reply logic when you need
+more (see `daemon.py`).
 
 ## 3. Verify
 

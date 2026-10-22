@@ -111,6 +111,20 @@ python3 daemon.py --echo
 # you'll get a single merged reply
 ```
 
+To have an LLM write the replies (any OpenAI-compatible API: OpenAI,
+DeepSeek, Qwen, Moonshot, a local Ollama, ...), use `--llm` mode instead —
+configuration is all environment variables:
+
+```bash
+LLM_API_KEY=sk-... python3 daemon.py --llm
+# optional: LLM_BASE_URL (default https://api.openai.com/v1),
+#           LLM_MODEL (default gpt-4o-mini), LLM_SYSTEM_PROMPT
+```
+
+`--llm` is an example handler: per-user context of the last 10 messages,
+stdlib only. For an agent setup with tools and long-term memory, see
+`examples/muse-hook/`.
+
 Command cheat sheet:
 
 ```bash
