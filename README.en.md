@@ -36,6 +36,16 @@ Use wechat-ilink-muse-bridge to connect WeChat to you: https://github.com/gfydfh
 It will deploy everything itself by following [`AGENTS.md`](AGENTS.md) in the
 repo root — you only need to pick up WeChat once, at the QR-scan step.
 
+One day-to-day flow worth knowing once deployed: **approving a new
+sender**. A message from someone outside the allowlist (say, your own
+second WeChat account) is ignored, but the sender's id is recorded in
+`data/unknown_senders.json` — the approval queue. To let them in, just
+say so in your main chat with Muse: it lists the pending ids with
+their sighting counts for your confirmation, then adds the approved one
+to `owner.json`, effective from the next poll. Approvals can only come
+from the main chat, never from inside a WeChat conversation — that lock
+keeps a stranger from talking their way onto the allowlist.
+
 ## Features
 
 - **Official protocol, QR-code login** — no reverse engineering, no

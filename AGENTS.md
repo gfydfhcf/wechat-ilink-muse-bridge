@@ -115,6 +115,12 @@ python3 ilink.py health            # add --offline to skip the live probe
 
 ## 4. Ongoing behavior
 
+- Approving new senders: ids of turned-away senders collect in
+  `unknown_senders.json`. When the user asks — in the main chat, never
+  via WeChat — to approve one, list the pending ids with first/last
+  seen times and counts, add only the id the user confirms to
+  `owner.json`'s `owner_ids`, and remove that entry from
+  `unknown_senders.json`. Takes effect on the next poll; no restart.
 - Session lifetime is unpredictable: early community reports suggested
   roughly 24h, but in production one login has stayed valid for 3+ days.
   When commands report `TOKEN_EXPIRED` / `NO_TOKEN`, ask the user to
