@@ -24,6 +24,23 @@ WeChat. On success the session is saved to `$ILINK_DATA_DIR/session.json`.
 That file is a **login credential**: keep it local, never commit it, never
 send it anywhere.
 
+## 1.5 Bind the owner (required, before first use)
+
+The bridge denies everyone until an owner is configured. Ask the user to
+send the bot any message: it is turned away, and the sender's id is
+recorded in `$ILINK_DATA_DIR/unknown_senders.json`. Take that id and
+write `$ILINK_DATA_DIR/owner.json`:
+
+```json
+{"owner_id": "<id>", "owner_ids": ["<id>"]}
+```
+
+`owner_id` is the primary account (proactive pushes and the typing
+indicator target it); `owner_ids` may list several accounts of the same
+human. From then on only allowlisted senders are queued. New senders
+keep landing in `unknown_senders.json` for manual approval — never
+approve one from inside a WeChat conversation itself.
+
 ## 2. Choose a driver
 
 **If you run inside Muse with its hook runtime available** (production
@@ -32,7 +49,10 @@ setup): wire `examples/muse-hook/ilink-watch.sh` as a hook that runs every
 each batch to a pending queue before waking you, and you claim it with an
 atomic `mv`. When woken, handle the batch under this contract:
 
-- Reply only to the owner (first sender; stored in `owner.json`).
+- Reply only to the owner. Enforcement is in code, not on you: `poll`
+  only queues senders allowlisted in `owner.json` (`owner_ids`), so any
+  batch you are woken with is already the owner's (possibly from one of
+  several accounts of the same human).
 - After claiming with `mv`, immediately `touch` the processing file:
   crash recovery judges staleness by file timestamps, and `mv` preserves
   the message-arrival time — an un-refreshed claim can be mistaken for a

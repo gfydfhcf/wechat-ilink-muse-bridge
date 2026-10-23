@@ -69,11 +69,13 @@ class ReviewFixesTest(unittest.TestCase):
         }
         payload = {"msgs": [voice_msg], "get_updates_buf": "BUF2"}
         saved = (ilink.load_session, ilink.api, ilink.load_contacts,
-                 ilink.save_contacts, ilink.download_media_item)
+                 ilink.save_contacts, ilink.download_media_item,
+                 ilink.load_owner_ids)
         ilink.load_session = lambda: {"bot_token": "tok"}
         ilink.api = lambda *a, **k: payload
         ilink.load_contacts = lambda: {}
         ilink.save_contacts = lambda c: None
+        ilink.load_owner_ids = lambda: {"u1"}  # sender is the owner here
         ilink.download_media_item = lambda item, t: (_ for _ in ()).throw(
             RuntimeError("boom"))
         try:
@@ -82,7 +84,8 @@ class ReviewFixesTest(unittest.TestCase):
                 rc = ilink.cmd_poll()
         finally:
             (ilink.load_session, ilink.api, ilink.load_contacts,
-             ilink.save_contacts, ilink.download_media_item) = saved
+             ilink.save_contacts, ilink.download_media_item,
+             ilink.load_owner_ids) = saved
         self.assertEqual(rc, 0)
         data = json.loads(out.getvalue())  # must parse as a single document
         self.assertEqual(len(data["msgs"]), 1)
@@ -98,11 +101,13 @@ class ReviewFixesTest(unittest.TestCase):
         }
         payload = {"msgs": [voice_msg], "get_updates_buf": "BUF3"}
         saved = (ilink.load_session, ilink.api, ilink.load_contacts,
-                 ilink.save_contacts, ilink.download_media_item)
+                 ilink.save_contacts, ilink.download_media_item,
+                 ilink.load_owner_ids)
         ilink.load_session = lambda: {"bot_token": "tok"}
         ilink.api = lambda *a, **k: payload
         ilink.load_contacts = lambda: {}
         ilink.save_contacts = lambda c: None
+        ilink.load_owner_ids = lambda: {"u1"}  # sender is the owner here
         ilink.download_media_item = lambda item, t: None
         try:
             out = io.StringIO()
@@ -110,7 +115,8 @@ class ReviewFixesTest(unittest.TestCase):
                 rc = ilink.cmd_poll()
         finally:
             (ilink.load_session, ilink.api, ilink.load_contacts,
-             ilink.save_contacts, ilink.download_media_item) = saved
+             ilink.save_contacts, ilink.download_media_item,
+             ilink.load_owner_ids) = saved
         self.assertEqual(rc, 0)
         entry = json.loads(out.getvalue())["msgs"][0]
         self.assertEqual(entry["kind"], "voice")

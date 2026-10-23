@@ -128,6 +128,11 @@ python3 ilink.py login <qrcode-id>     # session saved to data/session.json
 # 2. Start long polling (--echo is a demo handler: parrots everything back)
 python3 daemon.py --echo
 
+# 3. Bind the owner (required): send the bot any message — with no allowlist
+#    configured it is turned away and your id is recorded in
+#    data/unknown_senders.json; put that id into data/owner.json's
+#    owner_ids, then message again to chat normally
+
 # Now send the bot a couple of WeChat messages in a row —
 # you'll get a single merged reply
 ```
@@ -208,6 +213,15 @@ The data directory defaults to `./data/` and can be overridden with the
 `data/session.json` is a **login credential**, equivalent to a password: keep
 it local, it is already in `.gitignore`, and **never commit or share it**.
 The same goes for chat logs and the contacts cache.
+
+**Owner allowlist (enforced in code)**: `owner_ids` in `data/owner.json`
+is the only set of senders that can wake the bot (several accounts of the
+same human are fine; `owner_id` is the primary). Anyone else's messages
+are dropped at poll time: never queued, never waking the agent, never
+written to the contacts cache, media never downloaded. The sender's id
+is only recorded in `data/unknown_senders.json` for manual approval.
+With no `owner.json` at all, **everyone is denied** — complete step 3 of
+the quick start first.
 
 ## License
 

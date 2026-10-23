@@ -107,6 +107,10 @@ python3 ilink.py login <qrcode-id>     # 登录态存入 data/session.json
 # 2. 起长轮询（--echo 是演示 handler，收到什么回什么）
 python3 daemon.py --echo
 
+# 3. 绑定主人（必需）：先给机器人发一条任意消息——白名单未配置时它会被
+#    拦下、你的 ID 会记进 data/unknown_senders.json；把该 ID 填进
+#    data/owner.json 的 owner_ids，再发消息即可正常对话
+
 # 之后给机器人发条微信试试——连发两条，只会收到一条合并回复
 ```
 
@@ -170,6 +174,13 @@ python3 ilink.py proactive-video <user_id> <视频路径>    # 主动推送视�
 
 `data/session.json` 是**登录凭证**，等同于密码：只留在本地，已写进
 `.gitignore`，**永远不要提交、不要分享**。聊天记录、联系人缓存同理。
+
+**主人白名单（代码层强制）**：`data/owner.json` 的 `owner_ids` 是唯一
+能唤醒机器人的发信人名单（同一人的多个微信号可以都填上，`owner_id`
+是主号）。名单外的消息在 poll 阶段就被丢弃：不入队、不唤醒、不写
+联系人缓存、媒体不下载；发信人的 ID 只会记进
+`data/unknown_senders.json` 待你人工确认添加。没配 `owner.json` 时
+**默认拒绝所有人**，先按快速开始第 3 步完成绑定。
 
 ## License
 

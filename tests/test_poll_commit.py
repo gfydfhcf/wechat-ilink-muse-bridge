@@ -80,6 +80,10 @@ class PollCommitTest(unittest.TestCase):
                 os.remove(path)
         with open(ilink.SESSION_FILE, "w") as f:
             json.dump({"bot_token": "tok", "cursor": "BUF-1"}, f)
+        # The scenario's sender is the owner; without an owner.json the
+        # code-level allowlist (2026-10-23) would deny everyone.
+        with open(os.path.join(DATA_DIR, "owner.json"), "w") as f:
+            json.dump({"owner_id": "u1"}, f)
         self._orig_api = ilink.api
         ilink.api = fake_api
         self.addCleanup(self._restore)

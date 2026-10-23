@@ -254,6 +254,52 @@ def mark_seen(ids):
         save_seen(merged)
 
 
+def load_owner_ids():
+    """The owner allowlist: owner.json's `owner_ids` (several accounts of
+    the same human are fine), falling back to the legacy single
+    `owner_id`. A missing/empty owner.json yields an EMPTY set and poll
+    then denies everyone — deny-by-default is deliberate: the bot holds
+    the owner's memories and tools, so an unconfigured bridge must fail
+    closed, not open."""
+    try:
+        with open(os.path.join(BRIDGE, "owner.json")) as f:
+            data = json.load(f)
+    except Exception:
+        return set()
+    ids = list(data.get("owner_ids") or [])
+    if data.get("owner_id"):
+        ids.append(data["owner_id"])
+    return {str(i) for i in ids if i}
+
+
+def note_unknown_sender(from_id):
+    """Record a sender the allowlist turned away, in unknown_senders.json.
+
+    This is the approval queue: the deployer reads the ids here and adds
+    their own extra accounts to owner.json by hand. Only ids and counts
+    are kept — never message content. Capped at the 100 most recent
+    senders so a flood cannot grow the file without bound."""
+    path = os.path.join(BRIDGE, "unknown_senders.json")
+    try:
+        with open(path) as f:
+            book = json.load(f)
+    except Exception:
+        book = {}
+    now = int(time.time())
+    ent = book.get(from_id) or {"first_seen": now, "count": 0}
+    ent["last_seen"] = now
+    ent["count"] = ent.get("count", 0) + 1
+    book[from_id] = ent
+    if len(book) > 100:
+        book = dict(sorted(book.items(),
+                           key=lambda kv: kv[1].get("last_seen", 0))[-100:])
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(book, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
 def headers(token=None):
     uin = str(random.randint(0, 0xFFFFFFFF))
     h = {
@@ -354,12 +400,26 @@ def cmd_poll():
         return 2
     new_buf = data.get("get_updates_buf") or buf
     fresh, new_ids = filter_seen(data.get("msgs") or [])
+    owners = load_owner_ids()
+    filtered_senders = []
     msgs = []
     contacts = load_contacts()
     for m in fresh:
         if m.get("message_type") != 1:  # 只要用户发来的消息
             continue
         from_id = m.get("from_user_id")
+        if from_id not in owners:
+            # Owner allowlist (code-enforced): a stranger's message is
+            # never queued, never wakes the worker and never lands in
+            # the contacts cache. Its id stays in new_ids, so the commit
+            # step still advances past it — the server will not redeliver
+            # it and the queue cannot jam on it. The sender is noted in
+            # unknown_senders.json for manual approval (e.g. the owner
+            # messaging from a second account).
+            if from_id:
+                note_unknown_sender(from_id)
+                filtered_senders.append(from_id)
+            continue
         ctx = m.get("context_token")
         if from_id and ctx:
             contacts[from_id] = {"context_token": ctx, "updated_at": int(time.time())}
@@ -401,6 +461,8 @@ def cmd_poll():
     # before that simply re-fetches the same batch next poll — messages
     # may duplicate, but they are never lost.
     print(json.dumps({"msgs": msgs,
+                      "filtered": {"dropped": len(filtered_senders),
+                                   "senders": sorted(set(filtered_senders))},
                       "commit": {"cursor": new_buf, "ids": new_ids}},
                      ensure_ascii=False))
     return 0
@@ -851,6 +913,16 @@ def cmd_health(offline=False):
 
     try:
         lines.append(f"dedupe: {len(load_seen())} message ids recorded")
+    except Exception:
+        pass
+
+    lines.append(f"owners: {len(load_owner_ids())} allowlisted")
+    try:
+        with open(os.path.join(BRIDGE, "unknown_senders.json")) as f:
+            unknown = json.load(f)
+        if unknown:
+            lines.append(f"unknown senders: {len(unknown)} awaiting approval "
+                         "(unknown_senders.json)")
     except Exception:
         pass
 
