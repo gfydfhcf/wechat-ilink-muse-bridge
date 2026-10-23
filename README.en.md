@@ -70,6 +70,11 @@ repo root — you only need to pick up WeChat once, at the QR-scan step.
 - **Inbound dedupe** — the server occasionally redelivers the same message;
   poll filters by `message_id` (last 500 persisted to disk), so one message
   never gets two replies
+- **Owner allowlist** — only senders listed in `owner.json` can wake the
+  bot (enforced in code; several accounts of the same human are fine).
+  Anyone else is dropped at poll time — never queued, never waking the
+  agent — and their id lands in an approval queue for manual review.
+  With no allowlist configured, everyone is denied by default
 - **Closed-loop alerting** — bad news *and* good news: token expiry is
   reported once, then hourly; poll failures alert only after 10 continuous
   minutes (no crying wolf over jitter); recovery gets announced; a worker

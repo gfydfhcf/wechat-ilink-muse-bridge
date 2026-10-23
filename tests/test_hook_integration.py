@@ -45,7 +45,8 @@ elif len(sys.argv) > 1 and sys.argv[1] == "commit":
     data = sys.stdin.read()
     if os.environ.get("FAKE_COMMIT_FAIL"):
         sys.exit(1)
-    pend = os.path.join(os.environ["ILINK_HOOK_STATE"], "ilink-pending.json")
+    pend = os.path.join(os.environ.get("ILINK_HOOK_STATE_DIR")
+                        or os.environ["ILINK_HOOK_STATE"], "ilink-pending.json")
     order = "ORDER_OK" if os.path.exists(pend) else "ORDER_NA"
     with open(trace, "a") as f:
         f.write("COMMIT " + data.strip() + " " + order + "\\n")
@@ -84,15 +85,25 @@ class HookIntegrationTest(unittest.TestCase):
             f.write(script)
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
 
-    def run_hook(self, fake_out=None, dry=False, extra_env=None):
+    def run_hook(self, fake_out=None, dry=False, extra_env=None,
+                 legacy_env=False):
         env = dict(os.environ)
         env.update({
             "ILINK_DATA_DIR": self.bridge,
+            # Pin BOTH names to this test's dir: the suite shares one
+            # process env, and an unpinned name would leak another
+            # module's state dir into the script (canonical wins).
+            "ILINK_HOOK_STATE_DIR": self.state,
             "ILINK_HOOK_STATE": self.state,
             "HATCH_HOOK_RUNTIME": self.runtime,
             "HATCH_HOOK_DRY_RUN": "1" if dry else "0",
             "TRACE_CALLS": self.calls,
         })
+        if legacy_env:
+            # Only the legacy variable set: the script must still find
+            # the state dir through the alias.
+            env.pop("ILINK_HOOK_STATE_DIR", None)
+            env["ILINK_HOOK_STATE"] = self.state
         if fake_out is not None:
             env["FAKE_OUT"] = fake_out
         if extra_env:
@@ -115,6 +126,13 @@ class HookIntegrationTest(unittest.TestCase):
         self.assertIn("new_wechat_messages", calls)
         self.assertEqual(self.pending(), {"msgs": json.loads(BATCH)["msgs"]})
         self.assertIn('COMMIT {"cursor":"B2","ids":["7"]} ORDER_OK', calls)
+
+    def test_legacy_state_env_alias_still_works(self):
+        # Deployments made against the old example used ILINK_HOOK_STATE;
+        # with only that variable set the batch must land in the same dir.
+        calls = self.run_hook(BATCH, legacy_env=True)
+        self.assertIn("new_wechat_messages", calls)
+        self.assertEqual(self.pending(), {"msgs": json.loads(BATCH)["msgs"]})
 
     def test_empty_batch_still_commits(self):
         calls = self.run_hook(EMPTY)

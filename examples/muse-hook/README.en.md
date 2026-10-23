@@ -68,6 +68,7 @@ WeChat user ──message──> iLink server
   output is treated as a poll failure (a hard crash enters the alert
   state machine instead of masquerading as "no new messages").
 
-Paths in the script are parameterized (`ILINK_DATA_DIR`, `ILINK_HOOK_STATE`,
-`ILINK_CLIENT`). `$HATCH_HOOK_RUNTIME` is provided by the Muse hook runtime;
+Paths in the script are parameterized (`ILINK_DATA_DIR`, `ILINK_HOOK_STATE_DIR`,
+`ILINK_CLIENT`; the legacy state-dir name `ILINK_HOOK_STATE` still works, and
+the default matches `ilink.py health`). `$HATCH_HOOK_RUNTIME` is provided by the Muse hook runtime;
 outside Muse, use `daemon.py` in the repo root instead.

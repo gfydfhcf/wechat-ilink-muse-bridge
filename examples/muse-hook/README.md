@@ -51,6 +51,7 @@
   轮询故障处理（进程硬崩溃也会进告警状态机，而不是被当成"没有新
   消息"）。
 
-脚本里的路径已参数化（`ILINK_DATA_DIR`、`ILINK_HOOK_STATE`、`ILINK_CLIENT`），
+脚本里的路径已参数化（`ILINK_DATA_DIR`、`ILINK_HOOK_STATE_DIR`、`ILINK_CLIENT`；
+状态目录旧变量名 `ILINK_HOOK_STATE` 仍兼容，默认值与 `ilink.py health` 一致），
 `$HATCH_HOOK_RUNTIME` 是 Muse hook 运行时提供的环境，非 Muse 环境请用
 仓库根目录的 `daemon.py`。

@@ -883,9 +883,11 @@ def cmd_health(offline=False):
     elif token:
         lines.append("probe: skipped (--offline)")
 
-    # Message queue (hook state dir; ILINK_HOOK_STATE_DIR overrides, for tests)
-    state_dir = os.environ.get("ILINK_HOOK_STATE_DIR",
-                               os.path.expanduser("~/hooks/state"))
+    # Message queue (hook state dir — same canonical variable and default
+    # as the example hook script; ILINK_HOOK_STATE is a legacy alias)
+    state_dir = (os.environ.get("ILINK_HOOK_STATE_DIR")
+                 or os.environ.get("ILINK_HOOK_STATE")
+                 or os.path.expanduser("~/hooks/state"))
     pend = os.path.join(state_dir, "ilink-pending.json")
     proc = os.path.join(state_dir, "ilink-processing.json")
 

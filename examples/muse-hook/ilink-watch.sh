@@ -19,7 +19,10 @@ source "$HATCH_HOOK_RUNTIME"
 # Paths are parameterized for this public example. In production these point
 # at the bridge's data dir and the hook state dir.
 BRIDGE=${ILINK_DATA_DIR:-$HOME/wechat-ilink-data}
-STATE_DIR=${ILINK_HOOK_STATE:-$HOME/.ilink-hook-state}
+# Canonical name/default match `ilink.py health` (ILINK_HOOK_STATE_DIR,
+# ~/hooks/state) — the two MUST agree or health inspects an empty dir.
+# ILINK_HOOK_STATE is the legacy name, still honored as an alias.
+STATE_DIR=${ILINK_HOOK_STATE_DIR:-${ILINK_HOOK_STATE:-$HOME/hooks/state}}
 mkdir -p "$STATE_DIR"
 PENDING=$STATE_DIR/ilink-pending.json
 PROC=$STATE_DIR/ilink-processing.json

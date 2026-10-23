@@ -75,6 +75,21 @@ class HealthTest(unittest.TestCase):
         self.assertIn("probe: skipped (--offline)", out)
         self.assertIn("verdict: OK", out)
 
+    def test_state_dir_legacy_env_alias(self):
+        # health and the example hook once disagreed on the state dir
+        # (ILINK_HOOK_STATE_DIR + ~/hooks/state vs ILINK_HOOK_STATE +
+        # ~/.ilink-hook-state), so a by-the-book deploy's health read an
+        # empty directory forever. Canonical is ILINK_HOOK_STATE_DIR;
+        # the legacy name must still be honored on its own.
+        legacy = tempfile.mkdtemp(prefix="ilink-test-legacy-state-")
+        with open(os.path.join(legacy, "ilink-pending.json"), "w") as f:
+            json.dump({"msgs": [{"from_user_id": "u1"}]}, f)
+        write_session(bot_token="tok", login_at=int(time.time()))
+        with mock.patch.dict(os.environ, {"ILINK_HOOK_STATE": legacy}):
+            os.environ.pop("ILINK_HOOK_STATE_DIR", None)
+            code, out = run_health()
+        self.assertIn("queue: 1 message(s) pending", out)
+
     def test_pending_messages_are_reported_not_fatal(self):
         write_session(bot_token="tok", login_at=int(time.time()))
         with open(os.path.join(STATE_DIR, "ilink-pending.json"), "w") as f:
