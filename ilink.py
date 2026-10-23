@@ -5,6 +5,7 @@ Usage:
   ilink.py qrcode              # get login QR, save image, print QR_CODE:<id>
   ilink.py status <qrcode>     # poll scan status once (JSON)
   ilink.py login <qrcode>      # poll until confirmed (up to 300s), save token
+  ilink.py bind [seconds]      # one 10-min owner-binding window (first sender wins + welcome)
   ilink.py poll                # fetch new messages since cursor (JSON; two-phase: see commit)
   ilink.py commit              # commit a poll round (commit block via stdin): cursor + seen ids
   ilink.py send <to> <ctx> <text>  # send text reply (use - for stdin)
@@ -298,6 +299,269 @@ def note_unknown_sender(from_id):
         json.dump(book, f)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+
+
+# --- First-owner binding ----------------------------------------------------
+# Binding is a dedicated setup command, NOT part of normal polling: regular
+# poll stays deny-by-default forever. After QR login the deployer runs
+# `ilink.py bind`, which opens ONE bounded window (default 600s). The first
+# account to message the bot inside that window becomes the owner and gets
+# the three-part welcome below. If the window lapses, bind exits with
+# BIND_TIMEOUT (exit 3) so the deploying agent can remind the human and run
+# bind again — an unattended, indefinitely open "first come wins" mode
+# would let a stranger seize a bridge whose owner file was lost.
+BIND_DEFAULT_SECONDS = 600
+WELCOME_MESSAGES = [
+    "欢迎使用 WeChat iLink Muse Bridge！",
+    "绑定成功，当前微信账号已设为 Owner。今后只有 Owner 以及你手动批准的账号可以与我聊天。",
+    "现在可以直接给我发送消息了。",
+]
+
+
+def _owner_path():
+    return os.path.join(BRIDGE, "owner.json")
+
+
+def _bind_state_path():
+    return os.path.join(BRIDGE, "bind_state.json")
+
+
+def _bind_lock_path():
+    return os.path.join(BRIDGE, "bind.lock")
+
+
+def _save_json_atomic(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def save_owner(owner_id):
+    _save_json_atomic(_owner_path(),
+                      {"owner_id": owner_id, "owner_ids": [owner_id]})
+
+
+def load_bind_state():
+    try:
+        with open(_bind_state_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_bind_state(state):
+    _save_json_atomic(_bind_state_path(), state)
+
+
+def clear_bind_state():
+    try:
+        os.remove(_bind_state_path())
+    except FileNotFoundError:
+        pass
+
+
+def _acquire_bind_lock():
+    """Single-window lock: two bind commands must never race for the first
+    sender. A lock older than 15 minutes is treated as stale (the holder
+    died) and taken over once."""
+    path = _bind_lock_path()
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(path) > 900:
+                    os.remove(path)
+                    continue
+            except FileNotFoundError:
+                continue
+            return None
+        os.write(fd, json.dumps(
+            {"pid": os.getpid(), "started_at": int(time.time())}).encode())
+        return fd
+    return None
+
+
+def _release_bind_lock(fd):
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+    try:
+        os.remove(_bind_lock_path())
+    except FileNotFoundError:
+        pass
+
+
+def _send_welcome_segment(to_user_id, context_token, text, token, client_id):
+    """Send one welcome bubble. Network failures retry once with the SAME
+    client_id (same rule as cmd_send); application failures do not retry."""
+    for attempt in (1, 2):
+        try:
+            data = _send_raw(to_user_id, context_token, text, token,
+                             client_id=client_id)
+        except Exception as e:
+            if attempt == 1:
+                time.sleep(1)
+                continue
+            print(f"BIND_SEND_ERROR:{e}", file=sys.stderr, flush=True)
+            return False, None
+        code = data.get("code", 0)
+        if code == 0:
+            return True, code
+        return False, code
+    return False, None
+
+
+def _deliver_pending_welcome(token):
+    """Send any unsent welcome bubbles for a claimed owner, then commit the
+    binding batch. Progress is persisted after every bubble, so re-running
+    bind after a crash resumes where it stopped instead of re-binding or
+    re-sending from scratch."""
+    state = load_bind_state()
+    owner_id = state.get("owner_id")
+    if not owner_id:
+        print("BIND_STATE_INVALID")
+        return 1
+    ctx = state.get("context_token")
+    if not ctx:
+        print("BIND_NO_CONTEXT_TOKEN")
+        return 1
+    claim = str(state.get("claim_id") or state.get("claimed_at") or "bind")
+    sent = int(state.get("welcome_sent") or 0)
+    while sent < len(WELCOME_MESSAGES):
+        client_id = f"muse-wechat-bind-{claim}-{sent}"
+        ok, code = _send_welcome_segment(owner_id, ctx,
+                                         WELCOME_MESSAGES[sent], token,
+                                         client_id)
+        if code == -14:
+            print("TOKEN_EXPIRED")
+            return 2
+        if not ok:
+            print(f"BIND_WELCOME_FAILED:{sent + 1}")
+            return 1
+        sent += 1
+        state["welcome_sent"] = sent
+        save_bind_state(state)
+    commit = state.get("commit") or {}
+    if commit.get("cursor"):
+        s = load_session()
+        s["cursor"] = commit["cursor"]
+        save_session(s)
+    mark_seen(commit.get("ids") or [])
+    clear_bind_state()
+    print(f"BIND_OK:{owner_id}")
+    return 0
+
+
+def cmd_bind(wait_secs=BIND_DEFAULT_SECONDS):
+    """Open one owner-binding window and wait for the first message.
+
+    Exit codes: 0 bound (or already bound), 1 error / welcome pending,
+    2 token expired, 3 window timed out (remind the human, run again),
+    4 another bind window is already open."""
+    owners = load_owner_ids()
+    if owners and not load_bind_state():
+        primary = sorted(owners)[0]
+        print(f"ALREADY_BOUND:{primary}")
+        return 0
+    lock_fd = _acquire_bind_lock()
+    if lock_fd is None:
+        print("BIND_IN_PROGRESS")
+        return 4
+    try:
+        # Re-check under the lock: another window may have just finished.
+        owners = load_owner_ids()
+        state = load_bind_state()
+        s = load_session()
+        token = s.get("bot_token")
+        if not token:
+            print("NO_TOKEN")
+            return 1
+        if state and state.get("owner_id") in owners:
+            return _deliver_pending_welcome(token)
+        if owners:
+            clear_bind_state()
+            print(f"ALREADY_BOUND:{sorted(owners)[0]}")
+            return 0
+        if state:
+            clear_bind_state()  # stale claim whose owner file is gone
+
+        wait_secs = max(0, int(wait_secs))
+        print(f"BIND_WAITING:{wait_secs}", flush=True)
+        deadline = time.time() + wait_secs
+        buf = s.get("cursor", "")
+        while time.time() < deadline:
+            try:
+                data = api("POST", "ilink/bot/getupdates",
+                           {"get_updates_buf": buf,
+                            "base_info": {"channel_version": "1.0.2"}},
+                           token=token, timeout=40)
+            except Exception as e:
+                print(f"BIND_ERROR:{e}", file=sys.stderr, flush=True)
+                time.sleep(min(2, max(0, deadline - time.time())))
+                continue
+            if data.get("code") == -14:
+                print("TOKEN_EXPIRED")
+                return 2
+            new_buf = data.get("get_updates_buf") or buf
+            fresh, new_ids = filter_seen(data.get("msgs") or [])
+            winner = None
+            winner_ctx = None
+            for m in fresh:
+                if m.get("message_type") != 1:
+                    continue
+                sender = m.get("from_user_id")
+                if not sender:
+                    continue
+                if winner is None:
+                    winner = sender
+                    winner_ctx = m.get("context_token")
+                elif sender == winner:
+                    winner_ctx = m.get("context_token") or winner_ctx
+                else:
+                    # Same batch, different sender: too late — the first
+                    # sender wins; this one joins the approval queue.
+                    note_unknown_sender(sender)
+            if winner is None:
+                # Nothing claimable in this batch: commit it and keep
+                # waiting, so the normal driver never replays it later.
+                if new_buf != buf or new_ids:
+                    if new_buf:
+                        s["cursor"] = new_buf
+                        save_session(s)
+                    mark_seen(new_ids)
+                    buf = new_buf
+                continue
+            # Claim first, welcome second: once owner.json exists the
+            # window is closed to everyone else, whatever happens next.
+            save_owner(winner)
+            if winner_ctx:
+                contacts = load_contacts()
+                contacts[winner] = {"context_token": winner_ctx,
+                                    "updated_at": int(time.time())}
+                save_contacts(contacts)
+            source_id = next(
+                (str(m.get("message_id")) for m in fresh
+                 if m.get("from_user_id") == winner
+                 and m.get("message_id") is not None),
+                str(int(time.time())))
+            save_bind_state({
+                "owner_id": winner,
+                "context_token": winner_ctx,
+                "claim_id": source_id,
+                "claimed_at": int(time.time()),
+                "welcome_sent": 0,
+                "commit": {"cursor": new_buf, "ids": new_ids},
+            })
+            return _deliver_pending_welcome(token)
+        print("BIND_TIMEOUT")
+        return 3
+    finally:
+        _release_bind_lock(lock_fd)
 
 
 def headers(token=None):
@@ -961,6 +1225,8 @@ if __name__ == "__main__":
         cmd_qrcode()
     elif cmd == "login":
         sys.exit(cmd_login(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 300))
+    elif cmd == "bind":
+        sys.exit(cmd_bind(int(sys.argv[2]) if len(sys.argv) > 2 else BIND_DEFAULT_SECONDS))
     elif cmd == "poll":
         sys.exit(cmd_poll())
     elif cmd == "commit":

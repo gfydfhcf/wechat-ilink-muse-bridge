@@ -15,6 +15,7 @@ bots built on raw per-message dispatch feel robotic.)
 
 Usage:
   python3 ilink.py qrcode && python3 ilink.py login <qrcode>   # once
+  python3 ilink.py bind          # once: 10-min window, first sender = owner
   python3 daemon.py              # log incoming bursts, reply nothing
   python3 daemon.py --echo       # reply once per burst (demo handler)
   python3 daemon.py --llm        # reply with an LLM (example handler)

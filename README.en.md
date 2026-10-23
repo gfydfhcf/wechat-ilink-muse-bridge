@@ -36,6 +36,11 @@ Use wechat-ilink-muse-bridge to connect WeChat to you: https://github.com/gfydfh
 It will deploy everything itself by following [`AGENTS.md`](AGENTS.md) in the
 repo root — you only need to pick up WeChat once, at the QR-scan step.
 
+After login it will ask you to **send the bot a first message within 10
+minutes** to bind the owner: the first sender becomes the Owner and
+receives a three-part welcome; if nobody messages in time, it reminds
+you again and reopens the binding window.
+
 One day-to-day flow worth knowing once deployed: **approving a new
 sender**. A message from someone outside the allowlist (say, your own
 second WeChat account) is ignored, but the sender's id is recorded in
@@ -140,13 +145,14 @@ pip install -r requirements.txt
 python3 ilink.py qrcode
 python3 ilink.py login <qrcode-id>     # session saved to data/session.json
 
-# 2. Start long polling (--echo is a demo handler: parrots everything back)
-python3 daemon.py --echo
+# 2. Bind the owner (required): open the 10-minute binding window, then
+#    send the bot any message. The first sender becomes the Owner and
+#    gets a three-part welcome confirming the binding; on BIND_TIMEOUT
+#    just run the command again to reopen the window.
+python3 ilink.py bind
 
-# 3. Bind the owner (required): send the bot any message — with no allowlist
-#    configured it is turned away and your id is recorded in
-#    data/unknown_senders.json; put that id into data/owner.json's
-#    owner_ids, then message again to chat normally
+# 3. Start long polling (--echo is a demo handler: parrots everything back)
+python3 daemon.py --echo
 
 # Now send the bot a couple of WeChat messages in a row —
 # you'll get a single merged reply
@@ -175,12 +181,14 @@ don't have Docker anyway.) Session and media persist in the `./data` volume:
 ```bash
 docker compose run --rm bot python3 ilink.py qrcode        # QR login, once
 docker compose run --rm bot python3 ilink.py login <qrcode-id>
+docker compose run --rm bot python3 ilink.py bind          # message the bot within 10 min to bind the owner
 docker compose up -d                                       # --echo by default
 ```
 
 Command cheat sheet:
 
 ```bash
+python3 ilink.py bind                                   # bind the owner (10-min window, first sender wins)
 python3 ilink.py poll                                   # fetch one round of new messages (JSON)
 python3 ilink.py send <user_id> <context_token> -       # reply (body via stdin)
 python3 ilink.py proactive <user_id> -                  # proactive push (body via stdin)
@@ -235,8 +243,9 @@ same human are fine; `owner_id` is the primary). Anyone else's messages
 are dropped at poll time: never queued, never waking the agent, never
 written to the contacts cache, media never downloaded. The sender's id
 is only recorded in `data/unknown_senders.json` for manual approval.
-With no `owner.json` at all, **everyone is denied** — complete step 3 of
-the quick start first.
+With no `owner.json` at all, **everyone is denied** — complete step 2 of
+the quick start (`bind`) first. The binding window is a setup-time,
+10-minute affair — never leave one open unattended.
 
 ## License
 

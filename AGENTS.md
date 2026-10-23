@@ -24,22 +24,45 @@ WeChat. On success the session is saved to `$ILINK_DATA_DIR/session.json`.
 That file is a **login credential**: keep it local, never commit it, never
 send it anywhere.
 
-## 1.5 Bind the owner (required, before first use)
+## 1.5 Bind the owner (required, before starting any driver)
 
-The bridge denies everyone until an owner is configured. Ask the user to
-send the bot any message: it is turned away, and the sender's id is
-recorded in `$ILINK_DATA_DIR/unknown_senders.json`. Take that id and
-write `$ILINK_DATA_DIR/owner.json`:
+Binding is a dedicated, time-boxed step. Do NOT start the hook or the
+daemon before it completes — a running driver would consume the binding
+message as an ordinary turned-away sender. After login, run:
 
-```json
-{"owner_id": "<id>", "owner_ids": ["<id>"]}
+```bash
+python3 ilink.py bind            # opens one 600-second binding window
 ```
 
-`owner_id` is the primary account (proactive pushes and the typing
-indicator target it); `owner_ids` may list several accounts of the same
-human. From then on only allowlisted senders are queued. New senders
-keep landing in `unknown_senders.json` for manual approval — never
-approve one from inside a WeChat conversation itself.
+The moment it prints `BIND_WAITING:600`, tell the user in your main
+chat: **"Deployment is ready — please send the bot any WeChat message
+within 10 minutes to bind this account as its owner."** Then wait for
+the command to finish:
+
+- `BIND_OK:<id>` — bound. The bot has already sent the new owner a
+  three-part welcome (a greeting; what being Owner means; "you can talk
+  to me now"), the sender's context token is cached, and the binding
+  message itself is consumed — it was just the knock on the door. Now
+  start the driver (step 2) and ask the user for a normal test message.
+- `BIND_TIMEOUT` (exit code 3) — nobody messaged the bot within the
+  10 minutes. Remind the user again and re-run `ilink.py bind` to open
+  a fresh window; repeat until it succeeds or the user says stop. The
+  first sender inside a window wins by design, which is only safe while
+  the deployer is present and the bot is brand new — never leave a bind
+  window running unattended, and never widen it.
+- `BIND_WELCOME_FAILED:<n>` — the owner IS already bound (`owner.json`
+  is written), but a welcome bubble failed to send. Just re-run
+  `ilink.py bind`: it resumes the unsent bubbles and finishes the
+  commit; it will not re-bind anyone else.
+- `ALREADY_BOUND:<id>` — an owner already exists; binding is one-time.
+
+`owner.json` (written by bind) looks like
+`{"owner_id": "<id>", "owner_ids": ["<id>"]}`: `owner_id` is the
+primary account (proactive pushes and the typing indicator target it);
+`owner_ids` may list several accounts of the same human. From then on
+only allowlisted senders are queued. New senders keep landing in
+`unknown_senders.json` for manual approval — never approve one from
+inside a WeChat conversation itself.
 
 ## 2. Choose a driver
 

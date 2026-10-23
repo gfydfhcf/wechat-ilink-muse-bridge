@@ -33,6 +33,10 @@
 它会按仓库根目录的 [`AGENTS.md`](AGENTS.md) 自己完成部署，你只需要
 在扫码那一步拿出微信扫一下。
 
+登录后它还会请你在 **10 分钟内给机器人发第一条消息**完成主人绑定：
+第一个发信的账号即成为 Owner，并会收到三条欢迎消息；超时没发，
+它会再次提醒你并重开绑定窗口。
+
 部署完成后还有一个日常流程值得知道：**添加新发信人**。名单外的人
 （比如你自己的另一个微信号）给机器人发消息时不会被理会，但其 ID
 会记进 `data/unknown_senders.json`（待批名单）。想放行时，直接在
@@ -116,12 +120,13 @@ pip install -r requirements.txt
 python3 ilink.py qrcode
 python3 ilink.py login <qrcode-id>     # 登录态存入 data/session.json
 
-# 2. 起长轮询（--echo 是演示 handler，收到什么回什么）
-python3 daemon.py --echo
+# 2. 绑定主人（必需）：开启 10 分钟绑定窗口，然后给机器人发一条任意消息。
+#    第一个发信的账号即成为 Owner，机器人会连发三条欢迎消息确认绑定；
+#    超时没人发消息会输出 BIND_TIMEOUT，再次运行本命令重开窗口即可。
+python3 ilink.py bind
 
-# 3. 绑定主人（必需）：先给机器人发一条任意消息——白名单未配置时它会被
-#    拦下、你的 ID 会记进 data/unknown_senders.json；把该 ID 填进
-#    data/owner.json 的 owner_ids，再发消息即可正常对话
+# 3. 起长轮询（--echo 是演示 handler，收到什么回什么）
+python3 daemon.py --echo
 
 # 之后给机器人发条微信试试——连发两条，只会收到一条合并回复
 ```
@@ -143,12 +148,14 @@ Muse 的运行环境里通常也没有 Docker。）登录态和媒体存在 `./d
 ```bash
 docker compose run --rm bot python3 ilink.py qrcode        # 扫码登录一次
 docker compose run --rm bot python3 ilink.py login <qrcode-id>
+docker compose run --rm bot python3 ilink.py bind          # 10 分钟内发条消息绑定主人
 docker compose up -d                                        # 默认 --echo 模式
 ```
 
 单条命令速查：
 
 ```bash
+python3 ilink.py bind                                   # 绑定主人（10 分钟窗口，首个发信人成为 Owner）
 python3 ilink.py poll                                   # 拉一轮新消息（JSON）
 python3 ilink.py send <user_id> <context_token> -       # 发回复（正文走 stdin）
 python3 ilink.py proactive <user_id> -                  # 主动推送（正文走 stdin）
@@ -192,7 +199,8 @@ python3 ilink.py proactive-video <user_id> <视频路径>    # 主动推送视�
 是主号）。名单外的消息在 poll 阶段就被丢弃：不入队、不唤醒、不写
 联系人缓存、媒体不下载；发信人的 ID 只会记进
 `data/unknown_senders.json` 待你人工确认添加。没配 `owner.json` 时
-**默认拒绝所有人**，先按快速开始第 3 步完成绑定。
+**默认拒绝所有人**，先按快速开始第 2 步用 `bind` 完成绑定。绑定窗口
+只在部署时当场开启、限时 10 分钟——不要无人值守地开着窗口等人来。
 
 ## License
 

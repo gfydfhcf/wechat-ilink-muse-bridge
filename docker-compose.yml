@@ -1,7 +1,9 @@
 # One-command deployment:
 #   1. docker compose run --rm bot python3 ilink.py qrcode   # prints QR path
 #      docker compose run --rm bot python3 ilink.py login <qrcode-id>
-#   2. docker compose up -d
+#   2. docker compose run --rm bot python3 ilink.py bind     # 10-min owner
+#      binding window: send the bot a message to claim ownership
+#   3. docker compose up -d
 # The session and downloaded media persist in ./data (the bot's login
 # credential — keep it private, never commit it).
 services:
