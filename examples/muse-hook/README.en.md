@@ -45,6 +45,13 @@ WeChat user ──message──> iLink server
   verifies the sender is the owner and lights the typing indicator right
   away, instead of waiting for the worker's cold start; the worker's own
   typing calls are just keep-alive refreshes.
+- **Warm wait (no cold start mid-conversation)**: after replying, the
+  worker runs `ilink-warm-wait.sh` (default 180s idle window, 30-minute
+  session cap) instead of exiting. The waiter heartbeats a warm marker
+  (`ilink-warm.json`); while it is fresh the script lands new batches
+  without waking a second worker, and the warm worker claims them
+  within seconds and replies without re-reading context. A stale
+  heartbeat (dead worker) re-arms normal waking automatically.
 - **Token expiry nags once**: when the script sees `TOKEN_EXPIRED` it
   creates a `rescan_notified` marker and wakes the agent to ask the user
   to re-scan; while the marker exists, it never nags again.

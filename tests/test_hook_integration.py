@@ -166,6 +166,45 @@ class HookIntegrationTest(unittest.TestCase):
         with open(os.path.join(self.bridge, "alert-state.json")) as f:
             self.assertIn("err_since", json.load(f))
 
+    def write_warm(self, heartbeat_age=0, until_offset=1800):
+        import time
+        now = int(time.time())
+        warm = {"since": now - 60, "activity": now - 10,
+                "heartbeat": now - heartbeat_age,
+                "until": now + until_offset}
+        with open(os.path.join(self.state, "ilink-warm.json"), "w") as f:
+            json.dump(warm, f)
+
+    def test_warm_worker_suppresses_pending_wake(self):
+        # A warm worker (fresh heartbeat) is already watching the queue:
+        # the script must light typing but NOT wake a second worker.
+        pend_path = os.path.join(self.state, "ilink-pending.json")
+        with open(pend_path, "w") as f:
+            json.dump({"msgs": [{"from_user_id": "owner1", "message_id": 21}]}, f)
+        self.write_warm()
+        calls = self.run_hook()
+        self.assertNotIn("WAKE", calls)
+        self.assertIn("warm worker on duty", calls)
+
+    def test_stale_warm_marker_rearms_wake(self):
+        # Heartbeat older than 45s = the warm worker died; the script
+        # must fall back to a normal wake (self-healing).
+        pend_path = os.path.join(self.state, "ilink-pending.json")
+        with open(pend_path, "w") as f:
+            json.dump({"msgs": [{"from_user_id": "owner1", "message_id": 22}]}, f)
+        self.write_warm(heartbeat_age=120)
+        calls = self.run_hook()
+        self.assertIn("WAKE pending_wechat_messages", calls)
+
+    def test_warm_worker_gets_new_batch_without_wake(self):
+        # Fresh poll batch + warm worker: batch lands and commits as
+        # usual, but no wake is emitted — the waiter claims it itself.
+        self.write_warm()
+        calls = self.run_hook(BATCH)
+        self.assertEqual(self.pending(), {"msgs": json.loads(BATCH)["msgs"]})
+        self.assertIn('COMMIT {"cursor":"B2","ids":["7"]} ORDER_OK', calls)
+        self.assertNotIn("WAKE", calls)
+
     def test_pending_wake_reports_real_message_count(self):
         # Regression (2026-10-22 review): the pending branch counted with
         # `jq 'length'`, which counts the queue object's KEYS (always 1),

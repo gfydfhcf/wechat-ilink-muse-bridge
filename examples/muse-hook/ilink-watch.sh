@@ -26,6 +26,7 @@ STATE_DIR=${ILINK_HOOK_STATE_DIR:-${ILINK_HOOK_STATE:-$HOME/hooks/state}}
 mkdir -p "$STATE_DIR"
 PENDING=$STATE_DIR/ilink-pending.json
 PROC=$STATE_DIR/ilink-processing.json
+WARM=$STATE_DIR/ilink-warm.json
 RESCAN=$BRIDGE/rescan_notified
 POLLLOG=$BRIDGE/poll.log
 ALERT=$BRIDGE/alert-state.json
@@ -33,6 +34,20 @@ DRY=${HATCH_HOOK_DRY_RUN:-0}
 NOW=$(date +%s)
 
 now() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# 热态守候：worker 回复后不退出、由 ilink-warm-wait.sh 维护 ilink-warm.json
+# 标记（心跳 + 总时长上限）。心跳新鲜（<=45s）且未过总上限时，说明已有一个
+# 上下文就绪的 worker 在盯着队列——本脚本只管落盘/点亮输入，不再重复 wake；
+# 标记过期即视为 worker 已死，自动恢复正常 wake（自愈）。
+warm_alive() {
+  [ -f "$WARM" ] || return 1
+  local hb until_n
+  hb=$(jq -r '.heartbeat // 0' "$WARM" 2>/dev/null || echo 0)
+  until_n=$(jq -r '.until // 0' "$WARM" 2>/dev/null || echo 0)
+  case "$hb" in ''|*[!0-9]*) return 1 ;; esac
+  case "$until_n" in ''|*[!0-9]*) return 1 ;; esac
+  [ $((NOW - hb)) -le 45 ] && [ "$until_n" -gt "$NOW" ]
+}
 
 # 告警状态读写（jq，原子写；dry-run 不写状态，保持纯净）
 astate() { jq -r ".$1 // 0" "$ALERT" 2>/dev/null || echo 0; }
@@ -88,7 +103,12 @@ if [ -s "$PENDING" ]; then
       aset stuck_last "$NOW"
       extra=",\"stuck_alert\":true,\"stuck_minutes\":$(( (NOW - stuck_since) / 60 ))"
     fi
-    wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$extra}"
+    if warm_alive; then
+      log "warm worker on duty, $cnt pending left to it"
+      silent "warm worker on duty"
+    else
+      wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$extra}"
+    fi
   else
     silent "pending file empty"
   fi
@@ -198,7 +218,14 @@ else
         do_commit
         rec_extra=""
         if [ -n "$recovered" ]; then rec_extra=",\"recovered\":$recovered"; fi
-        wake "new_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$rec_extra}"
+        if [ -z "$recovered" ] && warm_alive; then
+          # 守候中的 worker 会在数秒内自己认领；带 recovered 时照常 wake，
+          # 免得恢复通知被吞掉（双 worker 靠 mv 原子认领仲裁，不重复处理）
+          log "warm worker on duty, batch left to it"
+          silent "warm worker on duty"
+        else
+          wake "new_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$rec_extra}"
+        fi
       fi
     elif [ -n "$recovered" ]; then
       do_commit

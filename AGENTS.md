@@ -89,6 +89,15 @@ atomic `mv`. When woken, handle the batch under this contract:
   message, and never split a single sentence across bubbles.
 - The script already lit the "typing…" indicator on arrival; refresh it if
   composing takes >30s and stop it after sending.
+- **Stay warm for follow-ups**: after cleanup, run
+  `examples/muse-hook/ilink-warm-wait.sh` instead of ending the turn. It
+  maintains the warm marker the watch script checks (while its heartbeat
+  is fresh the script will not wake a second worker) and prints one
+  line: on `NEW_MESSAGES`, loop back and claim the new batch WITHOUT
+  re-reading the memory/context files — your context is already current
+  (still re-check pending before sending and log the exchange as usual,
+  then wait again). On `IDLE_TIMEOUT` (default 180 quiet seconds) or
+  `TOTAL_CAP` (default 30-minute session cap), end the turn quietly.
 - Read what the user actually sent: image entries carry a downloaded
   `media_path` — look at the picture; file entries also carry a
   downloaded `media_path` (plus `file_name`) — open and read the
