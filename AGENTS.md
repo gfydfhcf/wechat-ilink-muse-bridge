@@ -94,6 +94,13 @@ atomic `mv`. When woken, handle the batch under this contract:
   the content naturally segments (a reaction, the substance, a
   question) — like a human texting — but never one reply per incoming
   message, and never split a single sentence across bubbles.
+- Replies may use Markdown: the WeChat client renders headings, bold,
+  italic, inline code, code blocks (with a language label, copy button
+  and syntax highlighting), lists, links, tables, strikethrough,
+  blockquotes and horizontal rules. Do NOT use task lists (they degrade
+  to bullets with literal `[ ]` / `[x]`), image syntax (only the alt
+  text survives — send pictures with `send-image` instead), or `$...$`
+  formulas (the delimiters are stripped and the content shows as-is).
 - The script already lit the "typing…" indicator on arrival; refresh it if
   composing takes >30s and stop it after sending.
 - **Stay warm for follow-ups**: after cleanup, run
