@@ -104,12 +104,17 @@ Claude Code 类（[crazynomad/weixin-claude-bot](https://github.com/crazynomad/w
 主动推送：任意程序 ──> ilink.py proactive（缓存 context_token）──> 微信
 ```
 
-两种轮询驱动任选其一：
+两种轮询驱动（hook 为生产级，`daemon.py` 为示例驱动）：
 
 | 方式 | 适合 | 入口 |
 | --- | --- | --- |
-| 独立守护进程 | 任何服务器/VPS | `daemon.py` |
+| 独立守护进程（示例） | 任何服务器/VPS | `daemon.py` |
 | Muse hook | Muse 运行时（生产在用） | `examples/muse-hook/` |
+
+> 注：`daemon.py` 是**示例驱动**，为展示协议与最小可运行实现而写：处理完成
+> 后才提交游标，崩溃或 handler 异常的窗口内同一批消息会被重投（至少一次、
+> 可能重复），不承诺生产级可靠。需要生产级投递（落盘队列、崩溃恢复、告警
+> 闭环）请用 hook 驱动。
 
 ## 快速开始
 

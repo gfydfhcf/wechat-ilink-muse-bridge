@@ -129,12 +129,20 @@ WeChat ──> iLink server ──getupdates long poll──> ilink.py poll
 Proactive push: any program ──> ilink.py proactive (cached context_token) ──> WeChat
 ```
 
-Two polling drivers, pick one:
+Two polling drivers (the hook driver is the production-grade one;
+`daemon.py` is an example driver):
 
 | Driver | Best for | Entry point |
 | --- | --- | --- |
-| Standalone daemon | any server / VPS | `daemon.py` |
+| Standalone daemon (example) | any server / VPS | `daemon.py` |
 | Muse hook | the Muse runtime (used in production) | `examples/muse-hook/` |
+
+> Note: `daemon.py` is an **example driver**, written to show the protocol
+> and the smallest runnable loop. It commits only after handling, so a
+> crash or a handler exception mid-burst re-delivers the batch
+> (at-least-once; duplicates possible) — it does not promise
+> production-grade delivery. For that (durable on-disk queue, crash
+> recovery, closed-loop alerting), use the hook driver.
 
 ## Quick start
 
