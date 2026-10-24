@@ -13,6 +13,14 @@
 #     短暂抖动未告警的静默清除状态
 #   - worker 卡住：processing 超 10 分钟被回收时记 stuck 起点，积压超 10 分钟
 #     随 pending 的 wake 带 stuck_alert（每小时至多一次）
+# 可靠性补强：
+#   - 单实例锁（flock）：重叠触发时后到的实例安静退出，防两个实例在
+#     查队列→poll→落盘→commit→唤醒全程互相覆盖
+#   - pending 损坏隔离：队列文件不可解析时改名 .corrupt-<epoch> 保留
+#     现场并在日志打 PENDING_CORRUPT 标记，绝不当成空队列覆盖或静默卡死
+#   - commit 待提交账本：commit 前先把 payload 原子落盘到
+#     ilink-commit-pending.json，成功才删；失败时下一轮开头先补交，
+#     补交成功前不 poll——commit 失败只是延迟，不与重拉交叠出重复处理
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -24,9 +32,16 @@ BRIDGE=${ILINK_DATA_DIR:-$HOME/wechat-ilink-data}
 # ILINK_HOOK_STATE is the legacy name, still honored as an alias.
 STATE_DIR=${ILINK_HOOK_STATE_DIR:-${ILINK_HOOK_STATE:-$HOME/hooks/state}}
 mkdir -p "$STATE_DIR"
+# 单实例锁：用 fd 持有 flock 到脚本结束（不要用 flock 命令包裹子命令，
+# 那样会漏掉段落）。拿不到锁 = 已有实例在跑，安静退出即可，不是错误。
+exec 9>"$STATE_DIR/ilink-watch.lock"
+if ! flock -n 9; then
+  exit 0
+fi
 PENDING=$STATE_DIR/ilink-pending.json
 PROC=$STATE_DIR/ilink-processing.json
 WARM=$STATE_DIR/ilink-warm.json
+COMMIT_PENDING=$STATE_DIR/ilink-commit-pending.json
 RESCAN=$BRIDGE/rescan_notified
 POLLLOG=$BRIDGE/poll.log
 ALERT=$BRIDGE/alert-state.json
@@ -34,6 +49,59 @@ DRY=${HATCH_HOOK_DRY_RUN:-0}
 NOW=$(date +%s)
 
 now() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# 带时间戳的一行日志进 poll.log（脚本平时落痕的地方；dry-run 不写）
+log_line() {
+  [ "$DRY" = "1" ] && return 0
+  echo "[$(now)] $1" >> "$POLLLOG"
+}
+
+# 队列文件三态计数：空/不存在 -> 0；合法 JSON 对象 -> msgs 条数；
+# 损坏（不可解析）-> 立即隔离改名保留现场、日志打 PENDING_CORRUPT
+# 标记、本轮按 0 处理。绝不把损坏文件当成空队列：当 0 条会被上层
+# 覆盖（丢消息）或误判成"队列已空"而静默卡死。
+queue_count() {
+  local path=$1 n iso
+  [ -s "$path" ] || { echo 0; return; }
+  if ! jq -e 'type == "object"' "$path" >/dev/null 2>&1; then
+    iso="$path.corrupt-$(date +%s)"
+    if mv "$path" "$iso" 2>/dev/null; then
+      log_line "PENDING_CORRUPT: $path unparseable, quarantined as $iso"
+      log "PENDING_CORRUPT: quarantined $path as $iso"
+    fi
+    echo 0
+    return
+  fi
+  n=$(jq '[.msgs[]?] | length' "$path" 2>/dev/null || echo 0)
+  echo "${n:-0}"
+}
+
+# commit 待提交账本补交：上一轮 commit 失败时 payload 留在
+# ilink-commit-pending.json。本轮 poll 之前先补交：成功删账本、继续；
+# 失败打 COMMIT_RETRY_FAILED 并返回非 0，本轮跳过 poll（旧批次未提交
+# 前拉新批次会交叠）。账本本身损坏则隔离丢弃并明确打标记——payload
+# 丢了游标就停在原地，下轮 poll 会把这批消息原样重拉，不丢消息。
+flush_commit_pending() {
+  [ -f "$COMMIT_PENDING" ] || return 0
+  [ "$DRY" = "1" ] && return 0
+  local payload iso
+  if ! jq -e 'type == "object"' "$COMMIT_PENDING" >/dev/null 2>&1; then
+    iso="$COMMIT_PENDING.corrupt-$(date +%s)"
+    mv "$COMMIT_PENDING" "$iso" 2>/dev/null || rm -f "$COMMIT_PENDING"
+    log_line "COMMIT_PENDING_CORRUPT: $COMMIT_PENDING unparseable, quarantined as $iso; its batch will be re-fetched"
+    log "COMMIT_PENDING_CORRUPT: quarantined $COMMIT_PENDING as $iso"
+    return 0
+  fi
+  payload=$(jq -c '.' "$COMMIT_PENDING")
+  if printf '%s' "$payload" | python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" commit >/dev/null 2>&1; then
+    rm -f "$COMMIT_PENDING"
+    log "retried pending commit OK"
+    return 0
+  fi
+  log_line "COMMIT_RETRY_FAILED: $COMMIT_PENDING still uncommitted, poll skipped this round"
+  log "commit retry failed, poll skipped this round"
+  return 1
+}
 
 # 热态守候：worker 回复后不退出、由 ilink-warm-wait.sh 维护 ilink-warm.json
 # 标记（心跳 + 总时长上限）。心跳新鲜（<=45s）且未过总上限时，说明已有一个
@@ -70,10 +138,7 @@ aset() {
 # mv 会刷新 ctime，ctime 才是真正的“被认领时间”。
 # 待处理队列里还有批次时不回收：先处理排队中的（它更新），卡住的下一轮再说。
 # 否则 mv 会覆盖掉尚未处理的新批次——覆盖即永久丢失。
-pending_msgs=0
-if [ -s "$PENDING" ]; then
-  pending_msgs=$(jq '[.msgs[]?] | length' "$PENDING" 2>/dev/null || echo 0)
-fi
+pending_msgs=$(queue_count "$PENDING")
 if [ -f "$PROC" ] && [ "${pending_msgs:-0}" -eq 0 ] && [ -n "$(find "$PROC" -cmin +10 2>/dev/null || true)" ]; then
   mv "$PROC" "$PENDING"
   log "recovered stale processing file to pending"
@@ -85,7 +150,7 @@ fi
 
 # 有未处理的消息（上一轮拉到、agent 还没吃完）：直接 wake，不再拉新的
 if [ -s "$PENDING" ]; then
-  cnt=$(jq '.msgs | length' "$PENDING" 2>/dev/null || echo 0)
+  cnt=$(queue_count "$PENDING")
   if [ "$cnt" -gt 0 ] 2>/dev/null; then
     log "pending $cnt messages waiting"
     # Leftover batches also light the typing indicator immediately (owner only)
@@ -113,6 +178,10 @@ if [ -s "$PENDING" ]; then
     silent "pending file empty"
   fi
   # 分支已结束（wake/silent 为最后调用）
+elif ! flush_commit_pending; then
+  # 上一轮的 commit 还没补交成功：本轮不 poll，避免新批次与未提交的
+  # 旧批次交叠（补交成功后旧批次的游标才推进，届时正常拉新消息）
+  silent "commit retry pending, poll skipped"
 else
   # 长轮询一轮（服务端 hold 住最多 35s）
   out=$(python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" poll 2>/dev/null || true)
@@ -190,11 +259,19 @@ else
     cnt=$(printf '%s' "$out" | jq '[.msgs[]?] | length' 2>/dev/null || echo 0)
     commit_json=$(printf '%s' "$out" | jq -c '.commit // empty' 2>/dev/null || true)
     # 提交本轮 poll（推进游标 + 记 seen）：只能在批次可靠落盘之后调用。
-    # 失败只记日志、不中断——下轮会重拉这批消息，宁可重复，绝不丢失。
+    # payload 先原子落盘成待提交账本再调 commit、成功才删账本：进程在
+    # 前后任一步崩溃，账本都还在，下轮开头先补交（见 flush_commit_pending）。
+    # 失败不中断本轮（批次已在队列里、worker 照常处理），COMMIT_FAILED
+    # 记入 poll.log 并注明账本位置——失败只是延迟，不与重拉交叠。
     do_commit() {
       if [ "$DRY" != "1" ] && [ -n "$commit_json" ]; then
-        printf '%s' "$commit_json" | python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" commit >/dev/null 2>&1 \
-          || echo "[$(now)] COMMIT_FAILED" >> "$POLLLOG"
+        local ctmp="$COMMIT_PENDING.tmp.$$"
+        printf '%s' "$commit_json" > "$ctmp" && mv "$ctmp" "$COMMIT_PENDING"
+        if printf '%s' "$commit_json" | python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" commit >/dev/null 2>&1; then
+          rm -f "$COMMIT_PENDING"
+        else
+          echo "[$(now)] COMMIT_FAILED: payload kept in $COMMIT_PENDING, retried next round" >> "$POLLLOG"
+        fi
       fi
     }
     if [ "${cnt:-0}" -gt 0 ] 2>/dev/null; then

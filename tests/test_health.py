@@ -98,6 +98,18 @@ class HealthTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("2 message(s) pending", out)
 
+    def test_corrupt_pending_queue_warns_not_empty(self):
+        # An unparseable pending file is a stuck batch, not a drained
+        # queue: health must warn and call it corrupt instead of
+        # reporting "nothing pending".
+        write_session(bot_token="tok", login_at=int(time.time()))
+        with open(os.path.join(STATE_DIR, "ilink-pending.json"), "w") as f:
+            f.write("{not json")
+        code, out = run_health()
+        self.assertEqual(code, 1)
+        self.assertIn("pending queue is corrupt", out)
+        self.assertIn("verdict: WARNINGS", out)
+
     def test_stale_processing_claim_warns(self):
         write_session(bot_token="tok", login_at=int(time.time()))
         proc = os.path.join(STATE_DIR, "ilink-processing.json")

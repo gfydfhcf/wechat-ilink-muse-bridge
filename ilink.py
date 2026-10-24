@@ -733,20 +733,27 @@ def cmd_poll():
 
 
 def cmd_commit():
-    """Commit one poll round: advance the cursor + record delivered ids.
+    """Commit one poll round: record delivered ids + advance the cursor.
     Reads the commit block from stdin: {"cursor": ..., "ids": [...]}.
-    Call only after the batch is durably queued. Idempotent."""
+    Call only after the batch is durably queued. Idempotent.
+
+    Order matters: seen ids are persisted BEFORE the cursor. If the
+    process dies between the two writes, the un-advanced cursor makes
+    the server redeliver the batch, and the recorded seen ids filter
+    the redelivery out — a duplicate poll, not a duplicate reply. The
+    old order (cursor first) could lose the seen write and let a
+    redelivery through as a fresh message."""
     try:
         payload = json.load(sys.stdin)
     except Exception as e:
         print(f"COMMIT_ERROR:bad stdin: {e}")
         return 1
+    mark_seen(payload.get("ids") or [])
     cursor = payload.get("cursor")
     if cursor:
         s = load_session()
         s["cursor"] = cursor
         save_session(s)
-    mark_seen(payload.get("ids") or [])
     print("COMMIT_OK")
     return 0
 
@@ -1156,14 +1163,24 @@ def cmd_health(offline=False):
     proc = os.path.join(state_dir, "ilink-processing.json")
 
     def _queue_count(path):
+        """(count, corrupt): a queue file that exists but does not
+        parse is corrupt — never report it as empty, or a stuck batch
+        looks like a drained queue."""
         try:
             with open(path) as f:
-                return len(json.load(f).get("msgs") or [])
+                return len(json.load(f).get("msgs") or []), False
+        except FileNotFoundError:
+            return 0, False
         except Exception:
-            return 0
+            return 0, True
 
-    if os.path.exists(pend) and _queue_count(pend) > 0:
-        lines.append(f"queue: {_queue_count(pend)} message(s) pending")
+    pend_n, pend_corrupt = _queue_count(pend)
+    if pend_corrupt:
+        warnings.append(
+            f"pending queue is corrupt (unparseable JSON): {pend} — "
+            "the hook quarantines it on its next run; inspect it there")
+    elif pend_n > 0:
+        lines.append(f"queue: {pend_n} message(s) pending")
     else:
         lines.append("queue: nothing pending")
     if os.path.exists(proc):

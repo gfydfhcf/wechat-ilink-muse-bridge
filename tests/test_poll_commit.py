@@ -67,6 +67,16 @@ def run_commit(commit_block):
     return buf.getvalue()
 
 
+def run_commit_allowing_crash(commit_block):
+    old_stdin = sys.stdin
+    sys.stdin = io.StringIO(json.dumps(commit_block))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            ilink.cmd_commit()
+    finally:
+        sys.stdin = old_stdin
+
+
 class PollCommitTest(unittest.TestCase):
     def setUp(self):
         # Pin paths per-test: other modules in the suite pin them too.
@@ -122,6 +132,31 @@ class PollCommitTest(unittest.TestCase):
     def test_commit_is_idempotent(self):
         out = run_poll()
         run_commit(out["commit"])
+        run_commit(out["commit"])
+        self.assertEqual(self.session_cursor(), "BUF-2")
+        self.assertEqual(ilink.load_seen(), ["4242"])
+
+    def test_commit_crash_after_seen_keeps_seen_not_cursor(self):
+        # Fault injection: the process dies saving the session (the
+        # cursor write) AFTER mark_seen has persisted. The write order
+        # (seen first, cursor second) must leave the ids recorded and
+        # the cursor un-advanced, so a redelivery is deduped instead of
+        # answered twice; re-running the same commit then fills in the
+        # cursor with no other side effect (idempotent).
+        out = run_poll()
+        orig_save = ilink.save_session
+
+        def boom(_s):
+            raise OSError("simulated crash between seen and cursor writes")
+
+        ilink.save_session = boom
+        try:
+            with self.assertRaises(OSError):
+                run_commit_allowing_crash(out["commit"])
+        finally:
+            ilink.save_session = orig_save
+        self.assertEqual(ilink.load_seen(), ["4242"])
+        self.assertEqual(self.session_cursor(), "BUF-1")
         run_commit(out["commit"])
         self.assertEqual(self.session_cursor(), "BUF-2")
         self.assertEqual(ilink.load_seen(), ["4242"])

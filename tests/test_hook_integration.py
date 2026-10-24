@@ -11,6 +11,12 @@ ilink.py, pinning the two-phase poll contract end to end:
     overwritten — the batch will simply be re-fetched next round)
   * stale-claim recycling never overwrites a non-empty pending queue
   * a hard crash (empty poll output) is a poll failure, not silence
+  * a corrupt pending queue is quarantined (PENDING_CORRUPT), never
+    silently treated as empty; a valid empty one stays quiet
+  * a second instance cannot run while the state-dir lock is held
+  * a failed commit persists in the commit ledger and is retried at
+    the START of the next round, before any new poll — the batch is
+    queued exactly once and the cursor ends up advanced
 
 The script is copied into the sandbox with ONE test-only substitution:
 `-cmin +10` becomes `-mmin +10` so `touch -d` can age queue files
@@ -35,21 +41,42 @@ wake() { echo "WAKE $1 $2" >> "$TRACE_CALLS"; }
 """
 
 FAKE_ILINK = """#!/usr/bin/env python3
-import os, sys
+import json, os, sys
 trace = os.environ["TRACE_CALLS"]
+HERE = os.path.dirname(os.path.abspath(__file__))
+CURSOR_FILE = os.path.join(HERE, "cursor")
+FAIL_ONCE_FILE = os.path.join(HERE, "fail_commit_once")
 if len(sys.argv) > 1 and sys.argv[1] == "poll":
-    out = os.environ.get("FAKE_OUT", "")
+    cur = ""
+    if os.path.exists(CURSOR_FILE):
+        with open(CURSOR_FILE) as f:
+            cur = f.read().strip()
+    # Once the cursor has advanced to B2 the server has nothing new:
+    # serve FAKE_OUT2 instead of redelivering the batch.
+    out = os.environ.get("FAKE_OUT2", "") if cur == "B2" \\
+        else os.environ.get("FAKE_OUT", "")
     if out:
         print(out)
 elif len(sys.argv) > 1 and sys.argv[1] == "commit":
     data = sys.stdin.read()
-    if os.environ.get("FAKE_COMMIT_FAIL"):
+    if os.environ.get("FAKE_COMMIT_FAIL") or os.path.exists(FAIL_ONCE_FILE):
+        if os.path.exists(FAIL_ONCE_FILE):
+            os.remove(FAIL_ONCE_FILE)
+        with open(trace, "a") as f:
+            f.write("COMMIT_FAIL " + data.strip() + "\\n")
         sys.exit(1)
     pend = os.path.join(os.environ.get("ILINK_HOOK_STATE_DIR")
                         or os.environ["ILINK_HOOK_STATE"], "ilink-pending.json")
     order = "ORDER_OK" if os.path.exists(pend) else "ORDER_NA"
     with open(trace, "a") as f:
         f.write("COMMIT " + data.strip() + " " + order + "\\n")
+    try:
+        payload = json.loads(data)
+    except Exception:
+        payload = {}
+    if payload.get("cursor"):
+        with open(CURSOR_FILE, "w") as f:
+            f.write(payload["cursor"])
 """
 
 BATCH = json.dumps({
@@ -204,6 +231,78 @@ class HookIntegrationTest(unittest.TestCase):
         self.assertEqual(self.pending(), {"msgs": json.loads(BATCH)["msgs"]})
         self.assertIn('COMMIT {"cursor":"B2","ids":["7"]} ORDER_OK', calls)
         self.assertNotIn("WAKE", calls)
+
+    def test_corrupt_pending_is_quarantined_not_treated_as_empty(self):
+        pend_path = os.path.join(self.state, "ilink-pending.json")
+        with open(pend_path, "w") as f:
+            f.write("{corrupt queue")
+        calls = self.run_hook(EMPTY)
+        # The corrupt file is preserved under a quarantine name (never
+        # overwritten), the marker lands in both logs, and the round
+        # carries on polling normally afterwards.
+        self.assertFalse(os.path.exists(pend_path))
+        quarantined = [n for n in os.listdir(self.state)
+                       if n.startswith("ilink-pending.json.corrupt-")]
+        self.assertEqual(len(quarantined), 1)
+        self.assertIn("PENDING_CORRUPT", calls)
+        with open(os.path.join(self.bridge, "poll.log")) as f:
+            self.assertIn("PENDING_CORRUPT", f.read())
+        self.assertIn('COMMIT {"cursor":"B9","ids":[]}', calls)
+
+    def test_valid_empty_pending_is_quiet(self):
+        pend_path = os.path.join(self.state, "ilink-pending.json")
+        with open(pend_path, "w") as f:
+            json.dump({"msgs": []}, f)
+        calls = self.run_hook()
+        self.assertIn("pending file empty", calls)
+        self.assertNotIn("PENDING_CORRUPT", calls)
+        self.assertTrue(os.path.exists(pend_path))  # left untouched
+
+    def test_lock_excludes_second_instance(self):
+        # Hold the state-dir lock the way a running instance does: a
+        # second invocation must exit quietly with no wake, no poll
+        # and no queue side effects at all.
+        import fcntl
+        lock_path = os.path.join(self.state, "ilink-watch.lock")
+        with open(lock_path, "w") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            calls = self.run_hook(BATCH)
+        self.assertEqual(calls.strip(), "")
+        self.assertIsNone(self.pending())
+
+    def test_failed_commit_is_deferred_via_ledger_not_duplicated(self):
+        # Round 1: the batch lands, commit fails -> the payload must
+        # persist in the commit ledger and COMMIT_FAILED is logged.
+        open(os.path.join(self.bridge, "fail_commit_once"), "w").close()
+        ledger = os.path.join(self.state, "ilink-commit-pending.json")
+        calls1 = self.run_hook(BATCH)
+        self.assertIn("new_wechat_messages", calls1)
+        self.assertIn("COMMIT_FAIL", calls1)
+        self.assertEqual(self.pending(),
+                         {"msgs": json.loads(BATCH)["msgs"]})
+        with open(ledger) as f:
+            self.assertEqual(json.load(f), {"cursor": "B2", "ids": ["7"]})
+        with open(os.path.join(self.bridge, "poll.log")) as f:
+            self.assertIn("COMMIT_FAILED", f.read())
+        # The worker claims the batch (queue drained) before round 2.
+        os.remove(os.path.join(self.state, "ilink-pending.json"))
+        open(self.calls, "w").close()  # trace only round 2 from here
+        # Round 2: the ledger is retried BEFORE polling and succeeds;
+        # with the cursor now at B2 the poll serves nothing new, so the
+        # batch is never queued a second time and the ledger is gone.
+        calls2 = self.run_hook(BATCH, extra_env={"FAKE_OUT2": EMPTY})
+        self.assertIn('COMMIT {"cursor":"B2","ids":["7"]}', calls2)
+        # the retry lands before round 2's own (empty-batch) commit
+        self.assertLess(calls2.index('COMMIT {"cursor":"B2"'),
+                        calls2.index('COMMIT {"cursor":"B9"'))
+        self.assertNotIn("new_wechat_messages", calls2)
+        self.assertIsNone(self.pending())
+        self.assertFalse(os.path.exists(ledger))
+        # Final cursor: B2 via the retried ledger, then B9 via round
+        # 2's own empty-batch commit — monotonically advanced, and the
+        # B2 batch was committed exactly once (see COMMIT order above).
+        with open(os.path.join(self.bridge, "cursor")) as f:
+            self.assertEqual(f.read(), "B9")
 
     def test_pending_wake_reports_real_message_count(self):
         # Regression (2026-10-22 review): the pending branch counted with
