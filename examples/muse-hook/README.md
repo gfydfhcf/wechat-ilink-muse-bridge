@@ -29,7 +29,10 @@
 - **不丢消息**：hook 脚本先把消息落盘再唤醒 agent。agent 崩溃/超时，
   消息还在队列里，下一轮脚本会再次唤醒。
 - **不重复回复**：认领用 `mv`（原子操作），多个重复唤醒里只有一个
-  能拿到队列，其余安静退出。
+  能拿到队列，其余安静退出。认领后立即 `touch` processing 文件、
+  处理期间约每 60 秒再 touch 一次续租：脚本按文件 ctime 超 10 分钟
+  回收，活着但慢的 worker 停 touch 也会被误判死亡、批次被重新唤醒
+  导致双 worker 各回一遍。
 - **发送幂等键**：回复某批次时，把该批次首条消息的 `message_id`
   作 `--key` 传给 send（例：`ilink.py send <to> <ctx> - --key <message_id>`）；
   同一 key 的重复调用直接回 `SEND_ALREADY_SENT` 而不重发——这拦的是

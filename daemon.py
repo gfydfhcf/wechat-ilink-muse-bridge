@@ -9,9 +9,16 @@ arrives — so this loop is effectively push, with second-level latency.
 It also implements burst merging: when a user sends several messages
 seconds apart ("吃完了" / "吃干净了"), the iLink server often returns
 them in separate poll responses. Instead of replying to each one, the
-daemon keeps collecting for MERGE_WINDOW seconds and dispatches the
+daemon keeps collecting while messages keep arriving and dispatches the
 whole burst as ONE user turn. (None of the popular iLink SDKs do this;
 bots built on raw per-message dispatch feel robotic.)
+
+MERGE_WINDOW is an IDLE window, not a total cap: every new message
+pushes the deadline out another MERGE_WINDOW seconds, so a chatty burst
+can collect for much longer than MERGE_WINDOW in total. It is also
+approximate rather than strict: the loop only re-checks the deadline
+between polls, and a single long-poll can run past the remaining
+window (poll_once's own timeout is 180s).
 
 Positioning: this is the EXAMPLE driver. It exists to show the wire
 protocol and the smallest runnable loop — not to be a production-grade
@@ -37,7 +44,8 @@ Usage:
   python3 daemon.py --llm        # reply with an LLM (example handler)
 
 Environment:
-  MERGE_WINDOW   seconds to keep collecting a burst (default 25)
+  MERGE_WINDOW   idle-gap seconds for burst collecting (default 25;
+                 approximate, not a strict cap — see collect_burst)
   ILINK_DATA_DIR data dir forwarded to ilink.py (default ./data)
   LLM_API_KEY    API key for --llm mode (required there)
   LLM_BASE_URL   OpenAI-compatible base URL (default https://api.openai.com/v1)
@@ -114,6 +122,11 @@ def commit_batch(commit):
 def collect_burst(first_msgs, first_commits):
     """Keep polling until MERGE_WINDOW elapses with no new messages.
 
+    MERGE_WINDOW is an idle window, not a total budget: each poll that
+    returns new messages pushes the deadline out another MERGE_WINDOW.
+    It is also approximate: the deadline is only re-checked between
+    polls, and one long-poll (timeout 180s) can overshoot it.
+
     Returns (msgs, commits): the merged burst and the commit block of
     every poll that fed it, in poll order, all still unsubmitted.
     """
@@ -164,10 +177,25 @@ def handle_burst(msgs, echo=False, llm=False):
             reply = "收到：" + " ".join(texts)
         _typing(user, "start")  # show "typing..." while the reply goes out
         try:
-            subprocess.run(
-                [sys.executable, os.path.join(HERE, "ilink.py"), "send", user, ctx, "-"],
-                input=reply, text=True, timeout=120,
+            # The reply is keyed by this user's first message of the
+            # burst, so a re-delivery after a skipped commit reuses the
+            # ledger intent instead of sending twice. A nonzero exit
+            # (SEND_FAILED / SEND_ERROR / TOKEN_EXPIRED) must raise:
+            # silently ignoring it used to commit the batch anyway and
+            # lose the reply. Timeout/OSError still raise on their own.
+            send_args = [sys.executable, os.path.join(HERE, "ilink.py"),
+                         "send", user, ctx, "-"]
+            first_id = items[0].get("message_id")
+            if first_id is not None:
+                send_args += ["--key", str(first_id)]
+            r = subprocess.run(
+                send_args, input=reply, text=True, timeout=120,
+                capture_output=True,
             )
+            if r.returncode != 0:
+                detail = ((r.stdout or "") + (r.stderr or "")).strip()[:200]
+                raise RuntimeError(
+                    f"send to {user} exited {r.returncode}: {detail}")
         finally:
             _typing(user, "stop")
 

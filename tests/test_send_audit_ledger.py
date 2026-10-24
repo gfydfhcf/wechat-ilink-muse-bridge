@@ -160,17 +160,27 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(api.call_count, 1)
 
     def test_failure_not_recorded_then_retry_ok(self):
-        with mock.patch.object(ilink, "api",
-                               side_effect=RuntimeError("boom")), \
+        # A failed send leaves an INTENT, not a success: the retry must
+        # still go through — reusing the intent's client_id, so a
+        # send-succeeded-but-unconfirmed first attempt is deduped by
+        # the server instead of delivering twice.
+        api = mock.Mock(side_effect=RuntimeError("boom"))
+        with mock.patch.object(ilink, "api", api), \
                 mock.patch.object(time, "sleep"):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-2")
         self.assertEqual(code, 1)
-        self.assertFalse(os.path.exists(ilink.SEND_LEDGER_FILE))
-        with mock.patch.object(ilink, "api", return_value={"code": 0}):
+        with open(ilink.SEND_LEDGER_FILE) as f:
+            ent = json.load(f)["m-2"]
+        self.assertEqual(ent["status"], "intent")
+        failed_cid = api.call_args[0][2]["msg"]["client_id"]
+        with mock.patch.object(ilink, "api",
+                               return_value={"code": 0}) as api2:
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-2")
             code2, out2 = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-2")
         self.assertIn("SEND_OK", out)
         self.assertIn("SEND_ALREADY_SENT", out2)
+        self.assertEqual(api2.call_args[0][2]["msg"]["client_id"],
+                         failed_cid)
 
     def test_different_keys_independent(self):
         api = mock.Mock(return_value={"code": 0})

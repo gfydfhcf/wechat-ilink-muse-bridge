@@ -213,6 +213,69 @@ class CommitBatchTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class HandleSendReturncodeTest(unittest.TestCase):
+    """handle_burst must not swallow a failed send: a nonzero exit
+    raises (so main skips the commit), and the send carries --key."""
+
+    def setUp(self):
+        self.send_calls = []
+        self._orig_run = daemon.subprocess.run
+        daemon.subprocess.run = self._fake_run
+        self.addCleanup(setattr, daemon.subprocess, "run", self._orig_run)
+
+    def _fake_run(self, args, **kwargs):
+        if "typing" in args:
+            return subprocess.CompletedProcess(args, 0, stdout="")
+        self.send_calls.append(list(args))
+        return self.send_result
+
+    def _handle(self, msgs):
+        daemon.handle_burst(msgs, echo=True)
+
+    def test_nonzero_send_exit_raises_and_carries_key(self):
+        self.send_result = subprocess.CompletedProcess([], 1,
+                                                       stdout="SEND_FAILED:x")
+        msg = dict(MSG, message_id="4242")
+        with self.assertRaises(RuntimeError):
+            self._handle([msg])
+        self.assertEqual(len(self.send_calls), 1)
+        args = self.send_calls[0]
+        self.assertIn("--key", args)
+        self.assertEqual(args[args.index("--key") + 1], "4242")
+
+    def test_zero_send_exit_returns_normally(self):
+        self.send_result = subprocess.CompletedProcess([], 0, stdout="SEND_OK")
+        self._handle([dict(MSG, message_id="4243")])  # must not raise
+        self.assertEqual(len(self.send_calls), 1)
+
+    def test_no_message_id_means_no_key(self):
+        self.send_result = subprocess.CompletedProcess([], 0, stdout="SEND_OK")
+        self._handle([MSG])  # MSG has no message_id
+        self.assertNotIn("--key", self.send_calls[0])
+
+    def test_failed_send_skips_commit_in_main_loop(self):
+        self.send_result = subprocess.CompletedProcess([], 1,
+                                                       stdout="SEND_FAILED:x")
+        harness = MainLoopHarness()
+        harness.setUp()
+        # main() decides echo/llm from argv: without --echo the
+        # handler skips sending entirely and this test would prove
+        # nothing. _restore puts argv back afterwards.
+        sys.argv = ["daemon.py", "--echo"]
+        commits = []
+        orig_commit = daemon.commit_batch
+        daemon.commit_batch = lambda c: commits.append(c) or True
+        try:
+            harness.poll_script = [("ok", [dict(MSG, message_id="4244")],
+                                   COMMIT)]
+            out, _ = harness.run_main()
+            self.assertIn("HANDLE_FAILED", out)
+            self.assertEqual(commits, [])
+        finally:
+            daemon.commit_batch = orig_commit
+            harness._restore()
+
+
 class PollOnceTest(unittest.TestCase):
     def test_poll_once_returns_commit_unsubmitted(self):
         calls = []

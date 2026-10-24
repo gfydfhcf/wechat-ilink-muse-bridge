@@ -23,19 +23,35 @@ Usage:
 
   --key <id> is an idempotency key (e.g. the batch's first message_id):
   a second invocation with the same key prints SEND_ALREADY_SENT and
-  does not call sendmessage again. Only successful sends are recorded.
-  Every send attempt is also appended to send_audit.jsonl in the data
-  dir (timestamp, direction, recipient, client_id, result, error type —
-  never message text or tokens).
+  does not call sendmessage again. A keyed send runs under an
+  inter-process ledger lock and persists its intent (with a stable
+  client_id) BEFORE calling sendmessage; only a confirmed success
+  flips the entry to sent, and a retry reuses the same client_id, so
+  the server's client_id dedupe covers the send-succeeded-but-
+  unconfirmed window too. Legacy ledger entries without a status
+  field (result 'ok') still count as sent. Every send attempt is also
+  appended to send_audit.jsonl in the data dir (timestamp, direction,
+  recipient, client_id, result, error type — never message text or
+  tokens). A retry under the same key with different text delivers at
+  most the first text — the deduped retry never re-delivers.
 """
 import base64
+import contextlib
+import functools
+import inspect
 import json
 import os
 import random
 import re
 import sys
+import threading
 import time
 import urllib.request
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl: the ledger lock degrades
+    fcntl = None  # to a no-op there (single-process use is unaffected).
 
 BASE_URL = "https://ilinkai.weixin.qq.com"
 # Data directory (session token, contacts cache, downloaded media).
@@ -51,9 +67,15 @@ SESSION_FILE = os.path.join(BRIDGE, "session.json")
 CONTACTS_FILE = os.path.join(BRIDGE, "contacts.json")  # from_user_id -> {context_token, updated_at}
 SEEN_FILE = os.path.join(BRIDGE, "seen_ids.json")  # delivered inbound message_ids (dedupe)
 SEND_AUDIT_FILE = os.path.join(BRIDGE, "send_audit.jsonl")  # one JSON line per send attempt
-SEND_LEDGER_FILE = os.path.join(BRIDGE, "send_ledger.json")  # idempotency key -> successful send
+SEND_LEDGER_FILE = os.path.join(BRIDGE, "send_ledger.json")  # idempotency key -> intent / successful send
+SEND_LEDGER_LOCK_FILE = os.path.join(BRIDGE, "send_ledger.lock")  # inter-process lock for keyed sends
 SEND_AUDIT_CAP = 1000  # audit lines kept; older lines are trimmed on write
 SEND_LEDGER_TTL = 86400  # ledger entries older than this are pruned on write
+MEDIA_MAX_BYTES = 100 * 1024 * 1024  # media sends refuse above this size:
+# the protocol needs the whole file AES-encrypted and uploaded in one
+# POST, so a send reads the file fully into memory (plus ciphertext).
+# Refusing up front beats letting a huge file exhaust process memory;
+# chunked upload would need a protocol change and is out of scope.
 MEDIA_DIR = os.path.join(BRIDGE, "media")
 CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 
@@ -854,14 +876,42 @@ def _load_send_ledger():
 
 
 def _record_send_ledger(key, client_id):
-    """Record a successful send under key; prune entries older than TTL.
-    Never raises."""
+    """Backwards-compatible alias: record a successful send under key.
+    New code uses _mark_send_ledger_sent; both write the same entry."""
+    _mark_send_ledger_sent(key, client_id)
+
+
+def _ledger_entry_is_sent(ent):
+    """A fresh 'sent' entry counts as delivered. Entries written before
+    the intent upgrade carry no status field but result 'ok': those are
+    legacy successes and count the same, so old ledger files stay valid."""
+    if not ent:
+        return False
+    if ent.get("status") == "sent":
+        return True
+    return ent.get("status") is None and ent.get("result") == "ok"
+
+
+def _ledger_entry_is_fresh(ent):
     try:
-        book = _load_send_ledger()
-        now = int(time.time())
-        book = {k: v for k, v in book.items()
-                if now - int(v.get("at", 0)) < SEND_LEDGER_TTL}
-        book[key] = {"client_id": client_id, "at": now, "result": "ok"}
+        return int(time.time()) - int(ent.get("at", 0)) < SEND_LEDGER_TTL
+    except (TypeError, ValueError):
+        return False
+
+
+def _check_send_ledger(key):
+    """Return the recorded entry for key if it is a fresh success, else None."""
+    if not key:
+        return None
+    ent = _load_send_ledger().get(key)
+    if not _ledger_entry_is_sent(ent) or not _ledger_entry_is_fresh(ent):
+        return None
+    return ent
+
+
+def _write_send_ledger(book):
+    """Atomic ledger write (tmp + replace). Never raises."""
+    try:
         tmp = SEND_LEDGER_FILE + ".tmp"
         with open(tmp, "w") as f:
             json.dump(book, f)
@@ -871,19 +921,112 @@ def _record_send_ledger(key, client_id):
         pass
 
 
-def _check_send_ledger(key):
-    """Return the recorded entry for key if it is a fresh success, else None."""
-    if not key:
-        return None
-    ent = _load_send_ledger().get(key)
-    if not ent or ent.get("result") != "ok":
-        return None
+def _prune_send_ledger(book, now):
+    # now is kept for call-site clarity; freshness itself is judged
+    # against the current clock (a few seconds of skew is immaterial
+    # next to a 24h TTL). Non-dict entries are dropped as malformed.
+    return {k: v for k, v in book.items()
+            if isinstance(v, dict) and _ledger_entry_is_fresh(v)}
+
+
+_ledger_lock_state = threading.local()
+
+
+@contextlib.contextmanager
+def _send_ledger_lock():
+    """Inter-process lock for a keyed send, held across check, intent
+    write, API call and result marking — so two processes racing on the
+    same key cannot both decide 'not sent yet'. Re-entrant within one
+    thread (the decorator below and the helpers share it); across
+    processes/threads fcntl serializes. Where fcntl is unavailable the
+    lock is a no-op and only the intent/client_id reuse still applies."""
+    state = _ledger_lock_state
+    if getattr(state, "depth", 0) > 0:
+        state.depth += 1
+        try:
+            yield
+        finally:
+            state.depth -= 1
+        return
+    fd = None
+    if fcntl is not None:
+        try:
+            fd = os.open(SEND_LEDGER_LOCK_FILE,
+                         os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except Exception:
+            if fd is not None:
+                os.close(fd)
+            fd = None
+    state.depth = 1
     try:
-        if int(time.time()) - int(ent.get("at", 0)) >= SEND_LEDGER_TTL:
-            return None
-    except (TypeError, ValueError):
-        return None
-    return ent
+        yield
+    finally:
+        state.depth = 0
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _keyed_send_locked(func):
+    """Decorator: a call carrying a --key runs entirely inside the
+    ledger lock; keyless sends are untouched (no lock, no behaviour
+    change). The key is the function's `key` argument, positional or
+    keyword."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            bound = inspect.signature(func).bind_partial(*args, **kwargs)
+            key = bound.arguments.get("key")
+        except Exception:
+            key = kwargs.get("key")
+        if not key:
+            return func(*args, **kwargs)
+        with _send_ledger_lock():
+            return func(*args, **kwargs)
+    return wrapper
+
+
+def _resolve_send_intent(key):
+    """Under the ledger lock: return (client_id, already_sent).
+
+    First call for a key persists an intent {client_id, at, status}
+    BEFORE any API call; a later call with the same key reuses that
+    client_id. Only a confirmed success flips the entry to 'sent'.
+    Application failures and exceptions leave the intent in place, so a
+    retry reuses the same client_id — and the server dedupes by
+    client_id (verified live 2026-10-23), so a 'sent but unconfirmed'
+    retry does not deliver twice. One accepted semantic: if a retry
+    carries different text under the same key, the user keeps at most
+    the first text, because the deduped retry never re-delivers."""
+    now = int(time.time())
+    book = _load_send_ledger()
+    ent = book.get(key)
+    if ent and _ledger_entry_is_fresh(ent):
+        if _ledger_entry_is_sent(ent):
+            return ent.get("client_id"), True
+        if ent.get("status") == "intent" and ent.get("client_id"):
+            return ent["client_id"], False
+    client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
+    book = _prune_send_ledger(book, now)
+    book[key] = {"client_id": client_id, "at": now, "status": "intent"}
+    _write_send_ledger(book)
+    return client_id, False
+
+
+def _mark_send_ledger_sent(key, client_id):
+    """Flip a key's intent to 'sent' after a confirmed success.
+    Never raises."""
+    try:
+        now = int(time.time())
+        book = _prune_send_ledger(_load_send_ledger(), now)
+        book[key] = {"client_id": client_id, "at": now,
+                     "status": "sent", "result": "ok"}
+        _write_send_ledger(book)
+    except Exception:
+        pass
 
 
 def _classify_send_response(data, require_message_id=False):
@@ -912,6 +1055,7 @@ def _proactive_needs_tokenless_retry(data, require_message_id=False):
     return "prepare failed" in str(data.get("errmsg", ""))
 
 
+@_keyed_send_locked
 def cmd_proactive(to_user_id, text, key=None):
     """主动推送：先用缓存的 context_token，失败则去掉 token 重试一次。"""
     s = load_session()
@@ -921,15 +1065,18 @@ def cmd_proactive(to_user_id, text, key=None):
         return 1
     if text == "-":
         text = sys.stdin.read()
-    if key and _check_send_ledger(key):
-        print("SEND_ALREADY_SENT")
-        return 0
+    if key:
+        client_id, already_sent = _resolve_send_intent(key)
+        if already_sent:
+            print("SEND_ALREADY_SENT")
+            return 0
+    else:
+        client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
     contacts = load_contacts()
     ctx = (contacts.get(to_user_id) or {}).get("context_token")
     if not ctx:
         print("NO_CONTEXT_TOKEN")
         return 1
-    client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
     try:
         t0 = time.time()
         data = _send_raw(to_user_id, ctx, text, token, client_id=client_id)
@@ -967,14 +1114,17 @@ def cmd_proactive(to_user_id, text, key=None):
             print(f"PROACTIVE_FAILED:{str(data)[:200]}")
             return 1
     if key:
-        _record_send_ledger(key, client_id)
+        _mark_send_ledger_sent(key, client_id)
     print("PROACTIVE_OK")
     return 0
 
 
+@_keyed_send_locked
 def cmd_send(to_user_id, context_token, text, key=None):
     """发送回复。网络层失败时用相同 client_id 最多重试一次；应用层明确失败不重试。
-    key 不为空且账本已有该 key 的成功记录时直接返回已发送，不再调用 API。"""
+    key 不为空时：账本已有该 key 的成功记录直接返回已发送，不再调用 API；
+    否则先落意图（含固定 client_id）再发送，成功后标记已发送——重试复用
+    同一 client_id，服务端去重兜底，崩溃窗口也不重复投递。"""
     s = load_session()
     token = s.get("bot_token")
     if not token:
@@ -982,10 +1132,13 @@ def cmd_send(to_user_id, context_token, text, key=None):
         return 1
     if text == "-":
         text = sys.stdin.read()
-    if key and _check_send_ledger(key):
-        print("SEND_ALREADY_SENT")
-        return 0
-    client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
+    if key:
+        client_id, already_sent = _resolve_send_intent(key)
+        if already_sent:
+            print("SEND_ALREADY_SENT")
+            return 0
+    else:
+        client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
     body = {
         "msg": {
             "from_user_id": "",
@@ -1021,7 +1174,7 @@ def cmd_send(to_user_id, context_token, text, key=None):
             print(f"SEND_FAILED:{str(data)[:200]}")
             return 1
         if key:
-            _record_send_ledger(key, client_id)
+            _mark_send_ledger_sent(key, client_id)
         print("SEND_OK")
         return 0
 
@@ -1190,6 +1343,7 @@ def _media_item(path, up, media_type, playtime_ms=0):
                                      "len": str(up["rawsize"])}}
 
 
+@_keyed_send_locked
 def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, key=None):
     """发送图片/视频/文件（回复模式，需 context_token）。"""
     s = load_session()
@@ -1197,16 +1351,28 @@ def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, k
     if not token:
         print("NO_TOKEN")
         return 1
-    if key and _check_send_ledger(key):
-        print("SEND_ALREADY_SENT")
-        return 0
+    if key:
+        client_id, already_sent = _resolve_send_intent(key)
+        if already_sent:
+            print("SEND_ALREADY_SENT")
+            return 0
+    try:
+        if os.path.getsize(path) > MEDIA_MAX_BYTES:
+            print(f"MEDIA_TOO_LARGE:{os.path.basename(path)} exceeds "
+                  f"{MEDIA_MAX_BYTES} bytes, refusing to read it fully "
+                  f"into memory")
+            return 1
+    except OSError as e:
+        print(f"MEDIA_READ_ERROR:{e}")
+        return 1
     try:
         with open(path, "rb") as f:
             data = f.read()
     except Exception as e:
         print(f"MEDIA_READ_ERROR:{e}")
         return 1
-    client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
+    if not key:
+        client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
     try:
         up = _upload_media(to_user_id, data, media_type, token)
         item = _media_item(path, up, media_type, playtime_ms)
@@ -1229,11 +1395,12 @@ def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, k
         print(f"SEND_FAILED:{str(data_resp)[:200]}")
         return 1
     if key:
-        _record_send_ledger(key, client_id)
+        _mark_send_ledger_sent(key, client_id)
     print("SEND_OK")
     return 0
 
 
+@_keyed_send_locked
 def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
     """主动推送图片/视频/文件：用缓存的 context_token，失败则去掉 token 重试一次。"""
     s = load_session()
@@ -1241,15 +1408,27 @@ def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
     if not token:
         print("NO_TOKEN")
         return 1
-    if key and _check_send_ledger(key):
-        print("SEND_ALREADY_SENT")
-        return 0
+    if key:
+        client_id, already_sent = _resolve_send_intent(key)
+        if already_sent:
+            print("SEND_ALREADY_SENT")
+            return 0
     contacts = load_contacts()
     ctx = (contacts.get(to_user_id) or {}).get("context_token")
     if not ctx:
         print("NO_CONTEXT_TOKEN")
         return 1
-    client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
+    if not key:
+        client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
+    try:
+        if os.path.getsize(path) > MEDIA_MAX_BYTES:
+            print(f"MEDIA_TOO_LARGE:{os.path.basename(path)} exceeds "
+                  f"{MEDIA_MAX_BYTES} bytes, refusing to read it fully "
+                  f"into memory")
+            return 1
+    except OSError as e:
+        print(f"MEDIA_READ_ERROR:{e}")
+        return 1
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -1290,7 +1469,7 @@ def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
             print(f"PROACTIVE_FAILED:{str(data_resp)[:200]}")
             return 1
     if key:
-        _record_send_ledger(key, client_id)
+        _mark_send_ledger_sent(key, client_id)
     print("PROACTIVE_OK")
     return 0
 

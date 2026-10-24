@@ -56,15 +56,22 @@ log_line() {
   echo "[$(now)] $1" >> "$POLLLOG"
 }
 
-# 队列文件三态计数：空/不存在 -> 0；合法 JSON 对象 -> msgs 条数；
-# 损坏（不可解析）-> 立即隔离改名保留现场、日志打 PENDING_CORRUPT
+# 队列文件三态计数：空/不存在 -> 0；合法队列（对象 + .msgs 数组）-> 条数；
+# 损坏或结构不对 -> 立即隔离改名保留现场、日志打 PENDING_CORRUPT
 # 标记、本轮按 0 处理。绝不把损坏文件当成空队列：当 0 条会被上层
 # 覆盖（丢消息）或误判成"队列已空"而静默卡死。
 queue_count() {
   local path=$1 n iso
   [ -s "$path" ] || { echo 0; return; }
-  if ! jq -e 'type == "object"' "$path" >/dev/null 2>&1; then
-    iso="$path.corrupt-$(date +%s)"
+  # Strict shape check, not just "parses as JSON": a file like
+  # {"msgs": "invalid"} parses fine but is not a queue. Counting it
+  # as 0 used to send the script down the silent "pending file empty"
+  # branch forever (the pending branch never reaches poll), a quiet
+  # total stall. Anything misshapen quarantines like corrupt input.
+  if ! jq -e 'type == "object" and (.msgs | type == "array")' "$path" >/dev/null 2>&1; then
+    # $$ in the name: two quarantines in the same second must not
+    # clobber each other (epoch seconds alone collide).
+    iso="$path.corrupt-$(date +%s)-$$"
     if mv "$path" "$iso" 2>/dev/null; then
       log_line "PENDING_CORRUPT: $path unparseable, quarantined as $iso"
       log "PENDING_CORRUPT: quarantined $path as $iso"

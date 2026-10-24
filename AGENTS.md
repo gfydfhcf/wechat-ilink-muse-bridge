@@ -79,7 +79,14 @@ atomic `mv`. When woken, handle the batch under this contract:
 - After claiming with `mv`, immediately `touch` the processing file:
   crash recovery judges staleness by file timestamps, and `mv` preserves
   the message-arrival time — an un-refreshed claim can be mistaken for a
-  stale one and bounced back to pending.
+  stale one and bounced back to pending. Keep renewing the lease while
+  you work the batch: `touch` the processing file at least about every
+  60 seconds during long reads, long generations and pre-send rechecks
+  — the hook recycles a claim whose ctime is over 10 minutes old, and a
+  live-but-slow worker that stops touching looks exactly like a dead
+  one, so the batch would be re-queued and a second worker could reply
+  to it too. The first touch is mandatory; the periodic ones are what
+  keep a slow turn from being recycled.
 - One composed response per burst: before sending, re-check the
   pending file; if newer messages arrived while you composed, merge
   them and re-compose against the newest context (max 3 rounds).

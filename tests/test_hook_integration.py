@@ -249,6 +249,29 @@ class HookIntegrationTest(unittest.TestCase):
             self.assertIn("PENDING_CORRUPT", f.read())
         self.assertIn('COMMIT {"cursor":"B9","ids":[]}', calls)
 
+    def test_structurally_invalid_pending_is_quarantined(self):
+        # JSON-valid but wrong-shaped queues must quarantine like
+        # corrupt ones. The old check (top-level object only) counted
+        # {"msgs": "invalid"} as 0, and the pending branch then exits
+        # silently without polling — a quiet total stall.
+        pend_path = os.path.join(self.state, "ilink-pending.json")
+        for content in ('{"msgs": "invalid"}', '{}', '{"msgs": 5}'):
+            with open(pend_path, "w") as f:
+                f.write(content)
+            before = {n for n in os.listdir(self.state)
+                      if n.startswith("ilink-pending.json.corrupt-")}
+            calls = self.run_hook(EMPTY)
+            self.assertFalse(os.path.exists(pend_path),
+                             f"misshapen pending survived: {content}")
+            after = {n for n in os.listdir(self.state)
+                     if n.startswith("ilink-pending.json.corrupt-")}
+            self.assertEqual(len(after - before), 1, content)
+            self.assertIn("PENDING_CORRUPT", calls)
+            with open(os.path.join(self.bridge, "poll.log")) as f:
+                self.assertIn("PENDING_CORRUPT", f.read())
+            # The round carries on polling normally afterwards.
+            self.assertIn('COMMIT {"cursor":"B9","ids":[]}', calls)
+
     def test_valid_empty_pending_is_quiet(self):
         pend_path = os.path.join(self.state, "ilink-pending.json")
         with open(pend_path, "w") as f:
