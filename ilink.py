@@ -877,7 +877,8 @@ def _load_send_ledger():
 
 def _record_send_ledger(key, client_id):
     """Backwards-compatible alias: record a successful send under key.
-    New code uses _mark_send_ledger_sent; both write the same entry."""
+    New code uses _mark_send_ledger_sent; both write the same entry,
+    and both propagate a write failure instead of swallowing it."""
     _mark_send_ledger_sent(key, client_id)
 
 
@@ -910,15 +911,18 @@ def _check_send_ledger(key):
 
 
 def _write_send_ledger(book):
-    """Atomic ledger write (tmp + replace). Never raises."""
-    try:
-        tmp = SEND_LEDGER_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(book, f)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, SEND_LEDGER_FILE)
-    except Exception:
-        pass
+    """Atomic ledger write (tmp + replace). Raises on failure, on
+    purpose: a ledger write is a correctness gate, not a best-effort
+    log — callers must not treat a failed write as success (a lost
+    intent means a later retry gets a fresh client_id and the server
+    dedupe can no longer cover it). tmp+replace already gives
+    atomicity; no fsync by design (a torn write is impossible, a lost
+    write is reported loudly instead)."""
+    tmp = SEND_LEDGER_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(book, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SEND_LEDGER_FILE)
 
 
 def _prune_send_ledger(book, now):
@@ -1000,7 +1004,10 @@ def _resolve_send_intent(key):
     client_id (verified live 2026-10-23), so a 'sent but unconfirmed'
     retry does not deliver twice. One accepted semantic: if a retry
     carries different text under the same key, the user keeps at most
-    the first text, because the deduped retry never re-delivers."""
+    the first text, because the deduped retry never re-delivers.
+    Raises if the intent itself cannot be persisted: the caller must
+    abort BEFORE any API call, or the send would go out with a
+    client_id no retry could ever reuse."""
     now = int(time.time())
     book = _load_send_ledger()
     ent = book.get(key)
@@ -1018,15 +1025,20 @@ def _resolve_send_intent(key):
 
 def _mark_send_ledger_sent(key, client_id):
     """Flip a key's intent to 'sent' after a confirmed success.
-    Never raises."""
-    try:
-        now = int(time.time())
-        book = _prune_send_ledger(_load_send_ledger(), now)
-        book[key] = {"client_id": client_id, "at": now,
-                     "status": "sent", "result": "ok"}
-        _write_send_ledger(book)
-    except Exception:
-        pass
+    Raises on write failure: the caller must NOT report success then,
+    because the ledger still says 'intent'. The caller reports the
+    send as unconfirmed (nonzero exit, no SEND_OK), so its driver does
+    not commit the batch and a later retry reuses the same client_id —
+    and the server's client_id dedupe then covers the resend, so the
+    user still receives exactly one message. A silent success here
+    would be worse than a loud retry: the next invocation would send
+    again believing nothing was recorded, and only the dedupe would
+    (usually) save it."""
+    now = int(time.time())
+    book = _prune_send_ledger(_load_send_ledger(), now)
+    book[key] = {"client_id": client_id, "at": now,
+                 "status": "sent", "result": "ok"}
+    _write_send_ledger(book)
 
 
 def _classify_send_response(data, require_message_id=False):
@@ -1066,7 +1078,15 @@ def cmd_proactive(to_user_id, text, key=None):
     if text == "-":
         text = sys.stdin.read()
     if key:
-        client_id, already_sent = _resolve_send_intent(key)
+        try:
+            client_id, already_sent = _resolve_send_intent(key)
+        except Exception as e:
+            # Intent not persisted: abort BEFORE any API call. Sending
+            # now would use a client_id no retry could reuse.
+            _audit_send("proactive", to_user_id, None, "ledger_error",
+                        error=type(e).__name__)
+            print(f"LEDGER_ERROR:{e}")
+            return 1
         if already_sent:
             print("SEND_ALREADY_SENT")
             return 0
@@ -1114,7 +1134,17 @@ def cmd_proactive(to_user_id, text, key=None):
             print(f"PROACTIVE_FAILED:{str(data)[:200]}")
             return 1
     if key:
-        _mark_send_ledger_sent(key, client_id)
+        try:
+            _mark_send_ledger_sent(key, client_id)
+        except Exception as e:
+            # Message may already be delivered, but the ledger cannot
+            # confirm it: report unconfirmed, not success. The driver
+            # will not commit the batch, and a retry reuses the same
+            # client_id, which the server dedupes — one delivery.
+            _audit_send("proactive", to_user_id, client_id, "ledger_error",
+                        error=type(e).__name__)
+            print(f"LEDGER_WRITE_FAILED:{e}")
+            return 1
     print("PROACTIVE_OK")
     return 0
 
@@ -1133,7 +1163,15 @@ def cmd_send(to_user_id, context_token, text, key=None):
     if text == "-":
         text = sys.stdin.read()
     if key:
-        client_id, already_sent = _resolve_send_intent(key)
+        try:
+            client_id, already_sent = _resolve_send_intent(key)
+        except Exception as e:
+            # Intent not persisted: abort BEFORE any API call. Sending
+            # now would use a client_id no retry could reuse.
+            _audit_send("send", to_user_id, None, "ledger_error",
+                        error=type(e).__name__)
+            print(f"LEDGER_ERROR:{e}")
+            return 1
         if already_sent:
             print("SEND_ALREADY_SENT")
             return 0
@@ -1174,7 +1212,17 @@ def cmd_send(to_user_id, context_token, text, key=None):
             print(f"SEND_FAILED:{str(data)[:200]}")
             return 1
         if key:
-            _mark_send_ledger_sent(key, client_id)
+            try:
+                _mark_send_ledger_sent(key, client_id)
+            except Exception as e:
+                # Message may already be delivered, but the ledger
+                # cannot confirm it: report unconfirmed, not success.
+                # The driver will not commit the batch, and a retry
+                # reuses the same client_id, which the server dedupes.
+                _audit_send("send", to_user_id, client_id, "ledger_error",
+                            error=type(e).__name__, attempt=attempt)
+                print(f"LEDGER_WRITE_FAILED:{e}")
+                return 1
         print("SEND_OK")
         return 0
 
@@ -1352,7 +1400,14 @@ def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, k
         print("NO_TOKEN")
         return 1
     if key:
-        client_id, already_sent = _resolve_send_intent(key)
+        try:
+            client_id, already_sent = _resolve_send_intent(key)
+        except Exception as e:
+            # Intent not persisted: abort BEFORE any read or API call.
+            _audit_send("media", to_user_id, None, "ledger_error",
+                        error=type(e).__name__)
+            print(f"LEDGER_ERROR:{e}")
+            return 1
         if already_sent:
             print("SEND_ALREADY_SENT")
             return 0
@@ -1395,7 +1450,17 @@ def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, k
         print(f"SEND_FAILED:{str(data_resp)[:200]}")
         return 1
     if key:
-        _mark_send_ledger_sent(key, client_id)
+        try:
+            _mark_send_ledger_sent(key, client_id)
+        except Exception as e:
+            # Message may already be delivered, but the ledger cannot
+            # confirm it: report unconfirmed, not success. The driver
+            # will not commit the batch, and a retry reuses the same
+            # client_id, which the server dedupes.
+            _audit_send("media", to_user_id, client_id, "ledger_error",
+                        error=type(e).__name__)
+            print(f"LEDGER_WRITE_FAILED:{e}")
+            return 1
     print("SEND_OK")
     return 0
 
@@ -1409,7 +1474,14 @@ def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
         print("NO_TOKEN")
         return 1
     if key:
-        client_id, already_sent = _resolve_send_intent(key)
+        try:
+            client_id, already_sent = _resolve_send_intent(key)
+        except Exception as e:
+            # Intent not persisted: abort BEFORE any read or API call.
+            _audit_send("media", to_user_id, None, "ledger_error",
+                        error=type(e).__name__)
+            print(f"LEDGER_ERROR:{e}")
+            return 1
         if already_sent:
             print("SEND_ALREADY_SENT")
             return 0
@@ -1469,7 +1541,17 @@ def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
             print(f"PROACTIVE_FAILED:{str(data_resp)[:200]}")
             return 1
     if key:
-        _mark_send_ledger_sent(key, client_id)
+        try:
+            _mark_send_ledger_sent(key, client_id)
+        except Exception as e:
+            # Message may already be delivered, but the ledger cannot
+            # confirm it: report unconfirmed, not success. The driver
+            # will not commit the batch, and a retry reuses the same
+            # client_id, which the server dedupes.
+            _audit_send("media", to_user_id, client_id, "ledger_error",
+                        error=type(e).__name__)
+            print(f"LEDGER_WRITE_FAILED:{e}")
+            return 1
     print("PROACTIVE_OK")
     return 0
 

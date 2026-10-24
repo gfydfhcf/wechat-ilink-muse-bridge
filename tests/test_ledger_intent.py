@@ -106,8 +106,11 @@ class IntentTest(unittest.TestCase):
 
     def test_crash_before_mark_reuses_client_id(self):
         # Simulate a crash between a successful send and its ledger
-        # marking: the first call raises, the retry must reuse the
-        # intent's client_id (server dedupe then covers the resend).
+        # marking. New semantics (ledger-write failures are loud, not
+        # silent): the first call reports LEDGER_WRITE_FAILED with a
+        # nonzero exit instead of SEND_OK or a bare exception, and the
+        # retry must reuse the intent's client_id (server dedupe then
+        # covers the resend).
         api_cids = []
 
         def api(*args, **kwargs):
@@ -126,8 +129,11 @@ class IntentTest(unittest.TestCase):
         with mock.patch.object(ilink, "api", side_effect=api), \
                 mock.patch.object(ilink, "_mark_send_ledger_sent",
                                   side_effect=flaky_mark):
-            with self.assertRaises(RuntimeError):
-                _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="k-crash")
+            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
+                             key="k-crash")
+        self.assertEqual(code, 1)
+        self.assertIn("LEDGER_WRITE_FAILED", out)
+        self.assertNotIn("SEND_OK", out)
         self.assertEqual(_ledger()["k-crash"]["status"], "intent")
         with mock.patch.object(ilink, "api", side_effect=api):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
@@ -161,6 +167,93 @@ class IntentTest(unittest.TestCase):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="k-old")
         self.assertEqual(code, 0)
         self.assertIn("SEND_ALREADY_SENT", out)
+        self.assertEqual(api.call_count, 0)
+
+
+class LedgerWriteFailureTest(unittest.TestCase):
+    """Ledger write failures must be loud, never silent (ChatGPT
+    follow-up, point 3): an unpersisted intent aborts the send before
+    any API call, and an unpersisted success marking is not SEND_OK."""
+
+    def setUp(self):
+        _pin_paths(self)
+
+    def _audit_entries(self):
+        try:
+            with open(ilink.SEND_AUDIT_FILE) as f:
+                return [json.loads(line) for line in f if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def test_intent_write_failure_aborts_send_before_api(self):
+        api = mock.Mock(return_value={"code": 0})
+        with mock.patch.object(ilink, "api", api), \
+                mock.patch.object(ilink, "_write_send_ledger",
+                                  side_effect=OSError("disk full")):
+            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
+                             key="k-intent-fail")
+        self.assertEqual(code, 1)
+        self.assertIn("LEDGER_ERROR", out)
+        self.assertNotIn("SEND_OK", out)
+        self.assertEqual(api.call_count, 0)
+        errors = [e for e in self._audit_entries()
+                  if e.get("result") == "ledger_error"]
+        self.assertTrue(errors)
+        self.assertEqual(errors[0]["error"], "OSError")
+
+    def test_mark_write_failure_not_success_then_retry_reuses_client_id(self):
+        # Intent write succeeds, the first success marking fails, the
+        # retry's marking succeeds: first call must not claim SEND_OK,
+        # and both API calls must share one client_id (server dedupe
+        # covers the resend, so the user still gets exactly one msg).
+        api_cids = []
+
+        def api(*args, **kwargs):
+            api_cids.append(args[2]["msg"]["client_id"])
+            return {"code": 0}
+
+        orig_write = ilink._write_send_ledger
+        calls = {"n": 0}
+
+        def flaky_write(book):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("disk full on mark")
+            return orig_write(book)
+
+        with mock.patch.object(ilink, "api", side_effect=api), \
+                mock.patch.object(ilink, "_write_send_ledger",
+                                  side_effect=flaky_write):
+            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
+                             key="k-mark-fail")
+        self.assertEqual(code, 1)
+        self.assertIn("LEDGER_WRITE_FAILED", out)
+        self.assertNotIn("SEND_OK", out)
+        self.assertEqual(_ledger()["k-mark-fail"]["status"], "intent")
+        with mock.patch.object(ilink, "api", side_effect=api):
+            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
+                             key="k-mark-fail")
+        self.assertEqual(code, 0)
+        self.assertIn("SEND_OK", out)
+        self.assertEqual(len(api_cids), 2)
+        self.assertEqual(api_cids[0], api_cids[1])
+        self.assertEqual(_ledger()["k-mark-fail"]["status"], "sent")
+
+    def test_media_intent_write_failure_aborts_before_upload(self):
+        path = os.path.join(DATA_DIR, "pic.jpg")
+        with open(path, "wb") as f:
+            f.write(b"fake-jpeg")
+        uploads = mock.Mock()
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
+        with mock.patch.object(ilink, "_upload_media", uploads), \
+                mock.patch.object(ilink, "api", api), \
+                mock.patch.object(ilink, "_write_send_ledger",
+                                  side_effect=OSError("disk full")):
+            code, out = _run(ilink.cmd_send_media, "u1", "ctx-1",
+                             path, 2, key="k-media-fail")
+        self.assertEqual(code, 1)
+        self.assertIn("LEDGER_ERROR", out)
+        self.assertEqual(uploads.call_count, 0)
         self.assertEqual(api.call_count, 0)
 
 
