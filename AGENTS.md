@@ -112,6 +112,15 @@ atomic `mv`. When woken, handle the batch under this contract:
   a number), never a summary guessed from the file name.
 - Never manually retry a failed send; the client already retries once with
   the same client_id.
+- Send with an idempotency key: when replying to a batch, pass the
+  batch's first message's `message_id` as `--key` to `ilink.py send`
+  (e.g. `ilink.py send <to> <ctx> - --key <message_id>`). A repeated
+  invocation with the same key prints `SEND_ALREADY_SENT` and does not
+  resend — this stops the "two independent invocations, fresh
+  client_ids" duplicates that server-side dedupe cannot catch. If the
+  reply splits into several bubbles, suffix each bubble's key with its
+  bubble number (`<message_id>-1`, `<message_id>-2`, …), or the later
+  bubbles will be suppressed as duplicates.
 - On `token_expired`, tell the user once that a re-scan is needed.
 - The script also runs a closed alert loop (see
   `examples/muse-hook/README.md`): an unfixed expiry is re-reported

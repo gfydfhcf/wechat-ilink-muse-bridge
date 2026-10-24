@@ -270,7 +270,19 @@ def main():
     noticed_expired = False
     print("long-poll daemon started (Ctrl+C to stop)", flush=True)
     while True:
-        status, msgs, commit = poll_once()
+        try:
+            status, msgs, commit = poll_once()
+        except Exception:
+            # poll_once itself can raise (e.g. the subprocess times out
+            # after 180s). That used to kill the whole daemon; now it is
+            # just a failed round — log, back off, keep looping. The
+            # cursor has not advanced, so nothing is lost.
+            print("POLL_EXCEPTION: poll_once raised; sleeping and continuing",
+                  flush=True)
+            traceback.print_exc()
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+            continue
         if status == "expired":
             if not noticed_expired:
                 print("TOKEN EXPIRED: run `ilink.py qrcode` + `login` again.", flush=True)

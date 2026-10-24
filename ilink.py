@@ -8,18 +8,25 @@ Usage:
   ilink.py bind [seconds]      # one 10-min owner-binding window (first sender wins + welcome)
   ilink.py poll                # fetch new messages since cursor (JSON; two-phase: see commit)
   ilink.py commit              # commit a poll round (commit block via stdin): cursor + seen ids
-  ilink.py send <to> <ctx> <text>  # send text reply (use - for stdin)
-  ilink.py proactive <to> <text>   # proactive push via cached context_token
+  ilink.py send <to> <ctx> <text> [--key <id>]  # send text reply (use - for stdin)
+  ilink.py proactive <to> <text> [--key <id>]   # proactive push via cached context_token
   ilink.py typing <to> <start|stop>  # show/cancel the "typing..." indicator
-  ilink.py send-image <to> <ctx> <path>   # reply with an image
-  ilink.py send-file <to> <ctx> <path>    # reply with a file
-  ilink.py send-video <to> <ctx> <path>   # reply with a video
+  ilink.py send-image <to> <ctx> <path> [--key <id>]   # reply with an image
+  ilink.py send-file <to> <ctx> <path> [--key <id>]    # reply with a file
+  ilink.py send-video <to> <ctx> <path> [--key <id>]   # reply with a video
   ilink.py send-voice <to> <ctx> <path> <playtime_ms>   # voice msg (SILK@24k; NOTE: channel silently drops outbound voice)
   ilink.py proactive-image <to> <path>    # proactive image via cached ctx
   ilink.py proactive-file <to> <path>     # proactive file via cached ctx
   ilink.py health [--offline]  # self-check: auth, queue, last poll (exit 0 ok / 1 warn / 2 bad)
   ilink.py proactive-video <to> <path>    # proactive video via cached ctx
   ilink.py proactive-voice <to> <path> <playtime_ms>   # proactive voice (dropped by channel, see send-voice)
+
+  --key <id> is an idempotency key (e.g. the batch's first message_id):
+  a second invocation with the same key prints SEND_ALREADY_SENT and
+  does not call sendmessage again. Only successful sends are recorded.
+  Every send attempt is also appended to send_audit.jsonl in the data
+  dir (timestamp, direction, recipient, client_id, result, error type —
+  never message text or tokens).
 """
 import base64
 import json
@@ -43,6 +50,10 @@ os.makedirs(os.path.join(BRIDGE, "media"), exist_ok=True)
 SESSION_FILE = os.path.join(BRIDGE, "session.json")
 CONTACTS_FILE = os.path.join(BRIDGE, "contacts.json")  # from_user_id -> {context_token, updated_at}
 SEEN_FILE = os.path.join(BRIDGE, "seen_ids.json")  # delivered inbound message_ids (dedupe)
+SEND_AUDIT_FILE = os.path.join(BRIDGE, "send_audit.jsonl")  # one JSON line per send attempt
+SEND_LEDGER_FILE = os.path.join(BRIDGE, "send_ledger.json")  # idempotency key -> successful send
+SEND_AUDIT_CAP = 1000  # audit lines kept; older lines are trimmed on write
+SEND_LEDGER_TTL = 86400  # ledger entries older than this are pruned on write
 MEDIA_DIR = os.path.join(BRIDGE, "media")
 CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 
@@ -179,8 +190,17 @@ def download_media_item(item: dict, item_type: int):
 
 def load_contacts():
     if os.path.exists(CONTACTS_FILE):
-        with open(CONTACTS_FILE) as f:
-            return json.load(f)
+        try:
+            with open(CONTACTS_FILE) as f:
+                data = json.load(f)
+        except Exception as e:
+            # Corrupt cache must not crash the whole command: warn on
+            # stderr (poll's stdout is machine-readable JSON) and fall
+            # back to an empty cache; the next poll rebuilds it.
+            print(f"WARNING: corrupt contacts file {CONTACTS_FILE}: {e}; "
+                  "treating as empty", file=sys.stderr, flush=True)
+            return {}
+        return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -586,8 +606,17 @@ def api(method, path, body=None, token=None, timeout=40):
 
 def load_session():
     if os.path.exists(SESSION_FILE):
-        with open(SESSION_FILE) as f:
-            return json.load(f)
+        try:
+            with open(SESSION_FILE) as f:
+                data = json.load(f)
+        except Exception as e:
+            # Same rule as load_contacts: a corrupt session file degrades
+            # to "not logged in" (the caller's NO_TOKEN path) instead of
+            # crashing the command with a traceback.
+            print(f"WARNING: corrupt session file {SESSION_FILE}: {e}; "
+                  "treating as empty", file=sys.stderr, flush=True)
+            return {}
+        return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -777,7 +806,113 @@ def _send_raw(to_user_id, context_token, text, token, client_id=None):
     return api("POST", "ilink/bot/sendmessage", body, token=token, timeout=40)
 
 
-def cmd_proactive(to_user_id, text):
+# --- Send audit log + idempotency ledger ------------------------------------
+# The 2026-10-23 duplicate-send diagnosis showed the failure mode is a
+# second, independent send invocation (fresh client_id), which server-side
+# client_id dedupe cannot stop. The audit log makes the next incident
+# provable in minutes; the ledger makes a repeated invocation with the
+# same key a no-op. Neither file ever carries message text or tokens —
+# only ids, outcomes and error type names.
+
+def _audit_send(direction, to_user_id, client_id, result, error=None,
+                attempt=1, elapsed_ms=None):
+    """Append one JSON line to the send audit log. Never raises: a logging
+    failure must not change the outcome of the send itself."""
+    try:
+        entry = {"ts": int(time.time()), "direction": direction,
+                 "to": to_user_id, "client_id": client_id,
+                 "result": result, "attempt": attempt}
+        if error:
+            entry["error"] = error
+        if elapsed_ms is not None:
+            entry["elapsed_ms"] = elapsed_ms
+        with open(SEND_AUDIT_FILE, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        try:
+            with open(SEND_AUDIT_FILE) as f:
+                lines = f.readlines()
+        except Exception:
+            return
+        if len(lines) > SEND_AUDIT_CAP:
+            tmp = SEND_AUDIT_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                f.writelines(lines[-SEND_AUDIT_CAP:])
+            os.replace(tmp, SEND_AUDIT_FILE)
+    except Exception:
+        pass
+
+
+def _load_send_ledger():
+    """key -> {client_id, at, result}. A corrupt file reads as empty and
+    is rebuilt on the next successful record — never crash a send."""
+    try:
+        with open(SEND_LEDGER_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _record_send_ledger(key, client_id):
+    """Record a successful send under key; prune entries older than TTL.
+    Never raises."""
+    try:
+        book = _load_send_ledger()
+        now = int(time.time())
+        book = {k: v for k, v in book.items()
+                if now - int(v.get("at", 0)) < SEND_LEDGER_TTL}
+        book[key] = {"client_id": client_id, "at": now, "result": "ok"}
+        tmp = SEND_LEDGER_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(book, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, SEND_LEDGER_FILE)
+    except Exception:
+        pass
+
+
+def _check_send_ledger(key):
+    """Return the recorded entry for key if it is a fresh success, else None."""
+    if not key:
+        return None
+    ent = _load_send_ledger().get(key)
+    if not ent or ent.get("result") != "ok":
+        return None
+    try:
+        if int(time.time()) - int(ent.get("at", 0)) >= SEND_LEDGER_TTL:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return ent
+
+
+def _classify_send_response(data, require_message_id=False):
+    """Shared send/proactive outcome rule: 'ok' | 'token_expired' | 'app_error'.
+    code -14 is always token expiry; code != 0 is an application failure.
+    When require_message_id is set (media sends), a code-0 response with
+    no message_id is also an application failure, not a success."""
+    code = data.get("code", 0)
+    if code == -14:
+        return "token_expired"
+    if code != 0:
+        return "app_error"
+    if require_message_id and not data.get("message_id"):
+        return "app_error"
+    return "ok"
+
+
+def _proactive_needs_tokenless_retry(data, require_message_id=False):
+    """proactive's retry-without-token trigger, on top of the shared rule:
+    any non-ok outcome, or a ret == -2 / 'prepare failed' response even
+    when code == 0 (the stale-context_token signature)."""
+    if _classify_send_response(data, require_message_id) != "ok":
+        return True
+    if data.get("ret") == -2:
+        return True
+    return "prepare failed" in str(data.get("errmsg", ""))
+
+
+def cmd_proactive(to_user_id, text, key=None):
     """主动推送：先用缓存的 context_token，失败则去掉 token 重试一次。"""
     s = load_session()
     token = s.get("bot_token")
@@ -786,30 +921,44 @@ def cmd_proactive(to_user_id, text):
         return 1
     if text == "-":
         text = sys.stdin.read()
+    if key and _check_send_ledger(key):
+        print("SEND_ALREADY_SENT")
+        return 0
     contacts = load_contacts()
     ctx = (contacts.get(to_user_id) or {}).get("context_token")
     if not ctx:
         print("NO_CONTEXT_TOKEN")
         return 1
+    client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
     try:
-        data = _send_raw(to_user_id, ctx, text, token)
+        t0 = time.time()
+        data = _send_raw(to_user_id, ctx, text, token, client_id=client_id)
     except Exception as e:
+        _audit_send("proactive", to_user_id, client_id, "exception",
+                    error=type(e).__name__, attempt=1)
         print(f"SEND_ERROR:{e}")
         return 1
-    code = data.get("code", 0)
-    ret = data.get("ret", 0)
-    errmsg = str(data.get("errmsg", ""))
-    if code == -14:
+    retry = _proactive_needs_tokenless_retry(data)
+    _audit_send("proactive", to_user_id, client_id,
+                "app_error" if retry else "ok",
+                elapsed_ms=int((time.time() - t0) * 1000), attempt=1)
+    if _classify_send_response(data) == "token_expired":
         print("TOKEN_EXPIRED")
         return 2
-    if code != 0 or ret == -2 or "prepare failed" in errmsg:
+    if retry:
         # context_token 可能过期，去掉 token 重试一次
-        print(f"RETRY_WITHOUT_TOKEN:{errmsg[:80]}", flush=True)
+        print(f"RETRY_WITHOUT_TOKEN:{str(data.get('errmsg', ''))[:80]}", flush=True)
         try:
-            data = _send_raw(to_user_id, None, text, token)
+            t0 = time.time()
+            data = _send_raw(to_user_id, None, text, token, client_id=client_id)
         except Exception as e:
+            _audit_send("proactive", to_user_id, client_id, "exception",
+                        error=type(e).__name__, attempt=2)
             print(f"SEND_ERROR:{e}")
             return 1
+        _audit_send("proactive", to_user_id, client_id,
+                    "ok" if data.get("code", 0) == 0 else "app_error",
+                    elapsed_ms=int((time.time() - t0) * 1000), attempt=2)
         code = data.get("code", 0)
         if code == -14:
             print("TOKEN_EXPIRED")
@@ -817,12 +966,15 @@ def cmd_proactive(to_user_id, text):
         if code != 0:
             print(f"PROACTIVE_FAILED:{str(data)[:200]}")
             return 1
+    if key:
+        _record_send_ledger(key, client_id)
     print("PROACTIVE_OK")
     return 0
 
 
-def cmd_send(to_user_id, context_token, text):
-    """发送回复。网络层失败时用相同 client_id 最多重试一次；应用层明确失败不重试。"""
+def cmd_send(to_user_id, context_token, text, key=None):
+    """发送回复。网络层失败时用相同 client_id 最多重试一次；应用层明确失败不重试。
+    key 不为空且账本已有该 key 的成功记录时直接返回已发送，不再调用 API。"""
     s = load_session()
     token = s.get("bot_token")
     if not token:
@@ -830,6 +982,9 @@ def cmd_send(to_user_id, context_token, text):
         return 1
     if text == "-":
         text = sys.stdin.read()
+    if key and _check_send_ledger(key):
+        print("SEND_ALREADY_SENT")
+        return 0
     client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
     body = {
         "msg": {
@@ -845,20 +1000,28 @@ def cmd_send(to_user_id, context_token, text):
     }
     for attempt in (1, 2):
         try:
+            t0 = time.time()
             data = api("POST", "ilink/bot/sendmessage", body, token=token, timeout=40)
         except Exception as e:
+            _audit_send("send", to_user_id, client_id, "exception",
+                        error=type(e).__name__, attempt=attempt)
             if attempt == 1:
                 time.sleep(5)
                 continue
             print(f"SEND_ERROR:{e}")
             return 1
-        code = data.get("code", 0)
-        if code == -14:
+        outcome = _classify_send_response(data)
+        _audit_send("send", to_user_id, client_id,
+                    "ok" if outcome == "ok" else "app_error",
+                    elapsed_ms=int((time.time() - t0) * 1000), attempt=attempt)
+        if outcome == "token_expired":
             print("TOKEN_EXPIRED")
             return 2
-        if code != 0:
+        if outcome != "ok":
             print(f"SEND_FAILED:{str(data)[:200]}")
             return 1
+        if key:
+            _record_send_ledger(key, client_id)
         print("SEND_OK")
         return 0
 
@@ -1027,74 +1190,107 @@ def _media_item(path, up, media_type, playtime_ms=0):
                                      "len": str(up["rawsize"])}}
 
 
-def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0):
+def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, key=None):
     """发送图片/视频/文件（回复模式，需 context_token）。"""
     s = load_session()
     token = s.get("bot_token")
     if not token:
         print("NO_TOKEN")
         return 1
+    if key and _check_send_ledger(key):
+        print("SEND_ALREADY_SENT")
+        return 0
     try:
         with open(path, "rb") as f:
             data = f.read()
     except Exception as e:
         print(f"MEDIA_READ_ERROR:{e}")
         return 1
+    client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
     try:
         up = _upload_media(to_user_id, data, media_type, token)
         item = _media_item(path, up, media_type, playtime_ms)
-        data_resp = _send_item_raw(to_user_id, context_token, item, token)
+        t0 = time.time()
+        data_resp = _send_item_raw(to_user_id, context_token, item, token,
+                                   client_id=client_id)
     except Exception as e:
+        _audit_send("media", to_user_id, client_id, "exception",
+                    error=type(e).__name__)
         print(f"SEND_ERROR:{e}")
         return 1
-    code = data_resp.get("code", 0)
-    if code == -14:
+    outcome = _classify_send_response(data_resp, require_message_id=True)
+    _audit_send("media", to_user_id, client_id,
+                "ok" if outcome == "ok" else "app_error",
+                elapsed_ms=int((time.time() - t0) * 1000))
+    if outcome == "token_expired":
         print("TOKEN_EXPIRED")
         return 2
-    if code != 0 or not data_resp.get("message_id"):
+    if outcome != "ok":
         print(f"SEND_FAILED:{str(data_resp)[:200]}")
         return 1
+    if key:
+        _record_send_ledger(key, client_id)
     print("SEND_OK")
     return 0
 
 
-def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0):
+def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
     """主动推送图片/视频/文件：用缓存的 context_token，失败则去掉 token 重试一次。"""
     s = load_session()
     token = s.get("bot_token")
     if not token:
         print("NO_TOKEN")
         return 1
+    if key and _check_send_ledger(key):
+        print("SEND_ALREADY_SENT")
+        return 0
     contacts = load_contacts()
     ctx = (contacts.get(to_user_id) or {}).get("context_token")
     if not ctx:
         print("NO_CONTEXT_TOKEN")
         return 1
+    client_id = f"muse-wechat-{random.randint(0, 0xFFFFFFFF):08x}"
     try:
         with open(path, "rb") as f:
             data = f.read()
         up = _upload_media(to_user_id, data, media_type, token)
         item = _media_item(path, up, media_type, playtime_ms)
-        data_resp = _send_item_raw(to_user_id, ctx, item, token)
+        t0 = time.time()
+        data_resp = _send_item_raw(to_user_id, ctx, item, token, client_id=client_id)
     except Exception as e:
+        _audit_send("media", to_user_id, client_id, "exception",
+                    error=type(e).__name__, attempt=1)
         print(f"SEND_ERROR:{e}")
         return 1
-    ok = data_resp.get("code", 0) == 0 and data_resp.get("message_id")
-    if data_resp.get("code", 0) == -14:
+    outcome = _classify_send_response(data_resp, require_message_id=True)
+    _audit_send("media", to_user_id, client_id,
+                "ok" if outcome == "ok" else "app_error",
+                elapsed_ms=int((time.time() - t0) * 1000), attempt=1)
+    if outcome == "token_expired":
         print("TOKEN_EXPIRED")
         return 2
-    if not ok:
+    if outcome != "ok":
         try:
-            data_resp = _send_item_raw(to_user_id, None, item, token)
+            t0 = time.time()
+            data_resp = _send_item_raw(to_user_id, None, item, token,
+                                       client_id=client_id)
         except Exception as e:
+            _audit_send("media", to_user_id, client_id, "exception",
+                        error=type(e).__name__, attempt=2)
             print(f"SEND_ERROR:{e}")
             return 1
-        if data_resp.get("code", 0) == -14:
+        outcome = _classify_send_response(data_resp, require_message_id=True)
+        _audit_send("media", to_user_id, client_id,
+                    "ok" if outcome == "ok" else "app_error",
+                    elapsed_ms=int((time.time() - t0) * 1000), attempt=2)
+        if outcome == "token_expired":
             print("TOKEN_EXPIRED")
             return 2
-        if data_resp.get("code", 0) != 0 or not data_resp.get("message_id"):
+        if outcome != "ok":
             print(f"PROACTIVE_FAILED:{str(data_resp)[:200]}")
             return 1
+    if key:
+        _record_send_ledger(key, client_id)
     print("PROACTIVE_OK")
     return 0
 
@@ -1236,44 +1432,91 @@ def cmd_health(offline=False):
     return 0
 
 
-if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+def _pop_key(args):
+    """Extract a trailing '--key <id>' pair from an argv tail.
+    Returns (key_or_None, remaining_args). A '--key' with no following
+    value is ignored rather than crashing."""
+    rest = list(args)
+    key = None
+    if "--key" in rest:
+        i = rest.index("--key")
+        if i + 1 < len(rest):
+            key = rest[i + 1]
+            del rest[i:i + 2]
+    return key, rest
+
+
+def _need(argv, n, usage):
+    """Arg-count guard: missing args print usage to stderr and exit 2
+    instead of raising a bare IndexError traceback."""
+    if len(argv) < n:
+        print(f"usage: {usage}", file=sys.stderr)
+        return False
+    return True
+
+
+def main(argv):
+    """CLI dispatch. Returns an exit code (does not call sys.exit itself,
+    so tests can call it directly)."""
+    cmd = argv[1] if len(argv) > 1 else ""
     if cmd == "qrcode":
         cmd_qrcode()
-    elif cmd == "login":
-        sys.exit(cmd_login(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 300))
-    elif cmd == "bind":
-        sys.exit(cmd_bind(int(sys.argv[2]) if len(sys.argv) > 2 else BIND_DEFAULT_SECONDS))
-    elif cmd == "poll":
-        sys.exit(cmd_poll())
-    elif cmd == "commit":
-        sys.exit(cmd_commit())
-    elif cmd == "health":
-        sys.exit(cmd_health(offline="--offline" in sys.argv))
-    elif cmd == "send":
-        sys.exit(cmd_send(sys.argv[2], sys.argv[3], sys.argv[4]))
-    elif cmd == "proactive":
-        sys.exit(cmd_proactive(sys.argv[2], sys.argv[3]))
-    elif cmd == "typing":
-        sys.exit(cmd_typing(sys.argv[2], sys.argv[3]))
-    elif cmd == "send-image":
-        sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 2))
-    elif cmd == "send-file":
-        sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 4))
-    elif cmd == "send-video":
-        sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 5))
-    elif cmd == "send-voice":
-        sys.exit(cmd_send_media(sys.argv[2], sys.argv[3], sys.argv[4], 3,
-                                int(sys.argv[5]) if len(sys.argv) > 5 else 0))
-    elif cmd == "proactive-image":
-        sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 2))
-    elif cmd == "proactive-file":
-        sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 4))
-    elif cmd == "proactive-video":
-        sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 5))
-    elif cmd == "proactive-voice":
-        sys.exit(cmd_proactive_media(sys.argv[2], sys.argv[3], 3,
-                                     int(sys.argv[4]) if len(sys.argv) > 4 else 0))
-    else:
-        print(__doc__)
-        sys.exit(2)
+        return 0
+    if cmd == "login":
+        if not _need(argv, 3, "ilink.py login <qrcode> [wait_secs]"):
+            return 2
+        return cmd_login(argv[2], int(argv[3]) if len(argv) > 3 else 300)
+    if cmd == "bind":
+        return cmd_bind(int(argv[2]) if len(argv) > 2 else BIND_DEFAULT_SECONDS)
+    if cmd == "poll":
+        return cmd_poll()
+    if cmd == "commit":
+        return cmd_commit()
+    if cmd == "health":
+        return cmd_health(offline="--offline" in argv)
+    if cmd == "send":
+        if not _need(argv, 5, "ilink.py send <to> <ctx> <text> [--key <id>]"):
+            return 2
+        key, _ = _pop_key(argv[5:])
+        return cmd_send(argv[2], argv[3], argv[4], key=key)
+    if cmd == "proactive":
+        if not _need(argv, 4, "ilink.py proactive <to> <text> [--key <id>]"):
+            return 2
+        key, _ = _pop_key(argv[4:])
+        return cmd_proactive(argv[2], argv[3], key=key)
+    if cmd == "typing":
+        if not _need(argv, 4, "ilink.py typing <to> <start|stop>"):
+            return 2
+        return cmd_typing(argv[2], argv[3])
+    if cmd in ("send-image", "send-file", "send-video"):
+        if not _need(argv, 5, f"ilink.py {cmd} <to> <ctx> <path> [--key <id>]"):
+            return 2
+        key, _ = _pop_key(argv[5:])
+        return cmd_send_media(argv[2], argv[3], argv[4],
+                              {"send-image": 2, "send-file": 4,
+                               "send-video": 5}[cmd], key=key)
+    if cmd == "send-voice":
+        if not _need(argv, 5, "ilink.py send-voice <to> <ctx> <path> [playtime_ms] [--key <id>]"):
+            return 2
+        key, rest = _pop_key(argv[5:])
+        playtime = int(rest[0]) if rest else 0
+        return cmd_send_media(argv[2], argv[3], argv[4], 3, playtime, key=key)
+    if cmd in ("proactive-image", "proactive-file", "proactive-video"):
+        if not _need(argv, 4, f"ilink.py {cmd} <to> <path> [--key <id>]"):
+            return 2
+        key, _ = _pop_key(argv[4:])
+        return cmd_proactive_media(argv[2], argv[3],
+                                   {"proactive-image": 2, "proactive-file": 4,
+                                    "proactive-video": 5}[cmd], key=key)
+    if cmd == "proactive-voice":
+        if not _need(argv, 4, "ilink.py proactive-voice <to> <path> [playtime_ms] [--key <id>]"):
+            return 2
+        key, rest = _pop_key(argv[4:])
+        playtime = int(rest[0]) if rest else 0
+        return cmd_proactive_media(argv[2], argv[3], 3, playtime, key=key)
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
