@@ -129,17 +129,52 @@ def collect_burst(first_msgs, first_commits):
 
     Returns (msgs, commits): the merged burst and the commit block of
     every poll that fed it, in poll order, all still unsubmitted.
+
+    In-burst dedupe by message_id: every poll in this loop runs before
+    any commit, so each poll subprocess re-reads the un-advanced cursor
+    from session.json, and filter_seen only filters ids already
+    persisted at commit time. If the server replays from the old
+    cursor, a later poll returns the same batch again — without this
+    set it would land in the burst twice and inflate the reply
+    context. Entries without a message_id are kept as-is (never
+    dropped on a missing key); duplicate commit blocks are harmless
+    (commit is idempotent) and kept in order.
     """
-    msgs = list(first_msgs)
+    seen_ids = set()
+
+    def _fresh(batch):
+        out = []
+        for m in batch:
+            mid = m.get("message_id") if isinstance(m, dict) else None
+            if mid is None:
+                out.append(m)
+                continue
+            try:
+                dup = mid in seen_ids
+            except TypeError:
+                out.append(m)  # unhashable id: keep, never drop
+                continue
+            if dup:
+                continue
+            seen_ids.add(mid)
+            out.append(m)
+        return out
+
+    msgs = _fresh(first_msgs)
     commits = list(first_commits)
     deadline = time.time() + MERGE_WINDOW
     while time.time() < deadline:
         status, more, commit = poll_once()
         if status == "ok" and more:
-            msgs.extend(more)
+            fresh = _fresh(more)
+            msgs.extend(fresh)
             if commit:
                 commits.append(commit)
-            deadline = time.time() + MERGE_WINDOW  # burst still going
+            # Only genuinely new messages extend the idle window: a
+            # replay-only poll (all duplicates) must not push the
+            # deadline out forever under a replaying server.
+            if fresh:
+                deadline = time.time() + MERGE_WINDOW  # burst still going
         elif status == "ok":
             if commit:
                 commits.append(commit)

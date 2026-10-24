@@ -54,6 +54,7 @@ class HealthTest(unittest.TestCase):
         ilink.SESSION_FILE = os.path.join(DATA_DIR, "session.json")
         ilink.CONTACTS_FILE = os.path.join(DATA_DIR, "contacts.json")
         ilink.SEEN_FILE = os.path.join(DATA_DIR, "seen_ids.json")
+        ilink.SEND_LEDGER_FILE = os.path.join(DATA_DIR, "send_ledger.json")
         os.environ["ILINK_HOOK_STATE_DIR"] = STATE_DIR
         for name in os.listdir(DATA_DIR):
             path = os.path.join(DATA_DIR, name)
@@ -108,6 +109,43 @@ class HealthTest(unittest.TestCase):
         code, out = run_health()
         self.assertEqual(code, 1)
         self.assertIn("pending queue is corrupt", out)
+        self.assertIn("verdict: WARNINGS", out)
+
+    def test_misshapen_pending_queue_is_corrupt(self):
+        # Same strict shape rule as the hook script's queue_count:
+        # top level must be an object and .msgs must be an array. A
+        # parseable-but-misshapen file used to report a string's
+        # length (or a dict's key count) as phantom backlog.
+        for content in ('{"msgs": "invalid"}', '{"msgs": 5}',
+                        '{"msgs": {"a": 1}}'):
+            with self.subTest(content=content):
+                write_session(bot_token="tok", login_at=int(time.time()) - 3600)
+                with open(os.path.join(STATE_DIR, "ilink-pending.json"),
+                          "w") as f:
+                    f.write(content)
+                code, out = run_health()
+                self.assertEqual(code, 1)
+                self.assertIn("pending queue is corrupt", out)
+
+    def test_empty_msgs_array_is_not_corrupt(self):
+        write_session(bot_token="tok", login_at=int(time.time()) - 3600)
+        with open(os.path.join(STATE_DIR, "ilink-pending.json"), "w") as f:
+            json.dump({"msgs": []}, f)
+        code, out = run_health()
+        self.assertEqual(code, 0)
+        self.assertIn("queue: nothing pending", out)
+        self.assertNotIn("pending queue is corrupt", out)
+
+    def test_corrupt_send_ledger_warns(self):
+        # Keyed sends fail closed while the ledger is damaged, so
+        # health must surface it instead of silently reading it as
+        # an empty (never-sent) ledger.
+        write_session(bot_token="tok", login_at=int(time.time()) - 3600)
+        with open(os.path.join(DATA_DIR, "send_ledger.json"), "w") as f:
+            f.write("garbage{")
+        code, out = run_health()
+        self.assertEqual(code, 1)
+        self.assertIn("send ledger is corrupt", out)
         self.assertIn("verdict: WARNINGS", out)
 
     def test_stale_processing_claim_warns(self):

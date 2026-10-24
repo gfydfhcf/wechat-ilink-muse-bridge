@@ -28,6 +28,7 @@ import os
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, ROOT)
@@ -303,3 +304,101 @@ class PollOnceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CollectBurstDedupeTest(unittest.TestCase):
+    """collect_burst dedupes by message_id in memory (ChatGPT 6th-round
+    review, P1). Every poll in a burst runs before any commit, so each
+    poll subprocess re-reads the un-advanced cursor; filter_seen only
+    filters ids persisted at commit time. If the server replays from
+    the old cursor, the same batch comes back twice — the burst must
+    still contain each message once."""
+
+    def setUp(self):
+        self._orig_poll = daemon.poll_once
+        self._orig_window = daemon.MERGE_WINDOW
+
+    def tearDown(self):
+        daemon.poll_once = self._orig_poll
+        daemon.MERGE_WINDOW = self._orig_window
+
+    def _scripted_poll(self, script):
+        it = iter(script)
+
+        def fake():
+            return next(it)
+        return fake
+
+    def test_replayed_batch_appears_once(self):
+        m1 = {"from_user_id": "u1", "message_id": "a",
+              "context_token": "ctx-1", "text": "hello", "kind": "text"}
+        m2 = {"from_user_id": "u1", "message_id": "b",
+              "context_token": "ctx-2", "text": "again", "kind": "text"}
+        c1 = {"cursor": "BUF-1", "ids": ["a", "b"]}
+        c2 = {"cursor": "BUF-2", "ids": ["a", "b"]}
+        c3 = {"cursor": "BUF-3", "ids": []}
+        daemon.poll_once = self._scripted_poll([
+            ("ok", [dict(m1), dict(m2)], c2),
+            ("ok", [], c3),
+        ])
+        burst, commits = daemon.collect_burst([m1, m2], [c1])
+        self.assertEqual([m["message_id"] for m in burst], ["a", "b"])
+        self.assertEqual(commits, [c1, c2, c3])
+
+    def test_first_batch_internal_duplicate_deduped(self):
+        m1 = {"from_user_id": "u1", "message_id": "a",
+              "context_token": "ctx-1", "text": "hello", "kind": "text"}
+        daemon.poll_once = self._scripted_poll([("ok", [], None)])
+        burst, _ = daemon.collect_burst([m1, dict(m1)], [])
+        self.assertEqual([m["message_id"] for m in burst], ["a"])
+
+    def test_entries_without_message_id_are_kept(self):
+        # No id to dedupe on: never drop, even if the content repeats.
+        n1 = {"from_user_id": "u1", "context_token": "ctx-1",
+              "text": "hello", "kind": "text"}
+        daemon.poll_once = self._scripted_poll([
+            ("ok", [dict(n1)], None),
+            ("ok", [], None),
+        ])
+        burst, _ = daemon.collect_burst([dict(n1)], [])
+        self.assertEqual(len(burst), 2)
+        self.assertTrue(all("message_id" not in m for m in burst))
+
+    def test_replay_only_poll_does_not_extend_window(self):
+        # A poll that returns only duplicates is not burst activity:
+        # it must not push the idle deadline out. Fake clock: deadline
+        # is computed at 1000 (window 25 -> 1025); the loop check at
+        # 1015 still runs one replay poll, but the check at 1030 must
+        # exit instead of polling again.
+        class FakeClock:
+            def __init__(self, values):
+                self._it = iter(values)
+                self._last = values[-1]
+
+            def time(self):
+                try:
+                    self._last = next(self._it)
+                except StopIteration:
+                    pass
+                return self._last
+
+            def sleep(self, s):
+                pass
+
+        m1 = {"from_user_id": "u1", "message_id": "a",
+              "context_token": "ctx-1", "text": "hello", "kind": "text"}
+        calls = []
+        replay = {"from_user_id": "u1", "message_id": "a",
+                  "context_token": "ctx-1", "text": "hello", "kind": "text"}
+
+        def fake_poll():
+            calls.append(1)
+            return "ok", [dict(replay)], None
+
+        daemon.poll_once = fake_poll
+        daemon.MERGE_WINDOW = 25
+        with mock.patch.object(daemon, "time",
+                               FakeClock([1000, 1015, 1030, 1060, 1090])):
+            burst, _ = daemon.collect_burst([m1], [])
+        self.assertEqual([m["message_id"] for m in burst], ["a"])
+        self.assertEqual(len(calls), 1)

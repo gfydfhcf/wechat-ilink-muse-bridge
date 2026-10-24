@@ -304,3 +304,127 @@ class MediaCapTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LedgerFailClosedTest(unittest.TestCase):
+    """Fail-closed ledger handling (ChatGPT 6th-round review, P1):
+    a lock that cannot be acquired must abort a keyed send instead of
+    proceeding unlocked, and a damaged ledger file must abort instead
+    of being read as empty (an empty fallback would forget recorded
+    successes and let a retry resend under a fresh client_id)."""
+
+    def setUp(self):
+        _pin_paths(self)
+
+    def _audit_entries(self):
+        try:
+            with open(ilink.SEND_AUDIT_FILE) as f:
+                return [json.loads(line) for line in f if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def test_lock_failure_aborts_keyed_send(self):
+        api = mock.Mock(return_value={"code": 0})
+        with mock.patch.object(ilink, "api", api), \
+                mock.patch.object(ilink.fcntl, "flock",
+                                  side_effect=OSError("flock broke")):
+            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
+                             key="k-lock-fail")
+        self.assertEqual(code, 1)
+        self.assertIn("LOCK_ERROR", out)
+        self.assertNotIn("SEND_OK", out)
+        self.assertEqual(api.call_count, 0)
+        errors = [e for e in self._audit_entries()
+                  if e.get("result") == "lock_error"]
+        self.assertTrue(errors)
+        self.assertEqual(errors[0]["error"], "OSError")
+
+    def test_lock_failure_keyless_send_unaffected(self):
+        api = mock.Mock(return_value={"code": 0})
+        with mock.patch.object(ilink, "api", api), \
+                mock.patch.object(ilink.fcntl, "flock",
+                                  side_effect=OSError("flock broke")):
+            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi")
+        self.assertEqual(code, 0)
+        self.assertIn("SEND_OK", out)
+        self.assertEqual(api.call_count, 1)
+
+    def test_fcntl_missing_keeps_noop(self):
+        # Non-POSIX platforms have no fcntl module at all: the lock is
+        # documented no-op there, and keyed sends must still work.
+        api = mock.Mock(return_value={"code": 0})
+        with mock.patch.object(ilink, "api", api), \
+                mock.patch.object(ilink, "fcntl", None):
+            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
+                             key="k-no-fcntl")
+        self.assertEqual(code, 0)
+        self.assertIn("SEND_OK", out)
+        self.assertEqual(api.call_count, 1)
+
+    def test_corrupt_ledger_aborts_keyed_send(self):
+        with open(ilink.SEND_LEDGER_FILE, "w") as f:
+            f.write("garbage{")
+        api = mock.Mock(return_value={"code": 0})
+        with mock.patch.object(ilink, "api", api):
+            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
+                             key="k-corrupt")
+        self.assertEqual(code, 1)
+        self.assertIn("LEDGER_CORRUPT", out)
+        self.assertNotIn("SEND_OK", out)
+        self.assertEqual(api.call_count, 0)
+        # The damaged file is left in place for inspection, not
+        # silently replaced by an empty ledger.
+        with open(ilink.SEND_LEDGER_FILE) as f:
+            self.assertEqual(f.read(), "garbage{")
+
+    def test_non_object_ledger_aborts_keyed_send(self):
+        with open(ilink.SEND_LEDGER_FILE, "w") as f:
+            json.dump([1, 2], f)
+        api = mock.Mock(return_value={"code": 0})
+        with mock.patch.object(ilink, "api", api):
+            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
+                             key="k-list-ledger")
+        self.assertEqual(code, 1)
+        self.assertIn("LEDGER_CORRUPT", out)
+        self.assertEqual(api.call_count, 0)
+
+    def test_missing_ledger_file_sends_normally(self):
+        # Missing is not corrupt: a fresh deploy has no ledger yet.
+        api = mock.Mock(return_value={"code": 0})
+        with mock.patch.object(ilink, "api", api):
+            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
+                             key="k-fresh")
+        self.assertEqual(code, 0)
+        self.assertIn("SEND_OK", out)
+        self.assertEqual(api.call_count, 1)
+
+    def test_corrupt_ledger_media_intent_aborts_before_upload(self):
+        with open(ilink.SEND_LEDGER_FILE, "w") as f:
+            f.write("garbage{")
+        api = mock.Mock(return_value={"code": 0})
+        upload = mock.Mock()
+        with mock.patch.object(ilink, "api", api), \
+                mock.patch.object(ilink, "_upload_media", upload):
+            code, out = _run(ilink.cmd_send_media, "u1", "ctx-1",
+                             "/nonexistent/x.png", 2, key="k-media-corrupt")
+        self.assertEqual(code, 1)
+        self.assertIn("LEDGER_CORRUPT", out)
+        self.assertEqual(upload.call_count, 0)
+        self.assertEqual(api.call_count, 0)
+
+    def test_mark_load_corrupt_reports_write_failed(self):
+        # Ledger readable at intent time, damaged before the success
+        # marking: same unconfirmed exit as a mark write failure (the
+        # message may already be delivered, but success is unconfirmed
+        # and the retry reuses the intent's client_id).
+        api = mock.Mock(return_value={"code": 0})
+        loads = [{}, ilink.LedgerCorrupt("boom")]
+        with mock.patch.object(ilink, "api", api), \
+                mock.patch.object(ilink, "_load_send_ledger",
+                                  side_effect=loads):
+            code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
+                             key="k-mark-corrupt")
+        self.assertEqual(code, 1)
+        self.assertIn("LEDGER_WRITE_FAILED", out)
+        self.assertNotIn("SEND_OK", out)
+        self.assertEqual(api.call_count, 1)

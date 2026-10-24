@@ -864,15 +864,36 @@ def _audit_send(direction, to_user_id, client_id, result, error=None,
         pass
 
 
+class LedgerCorrupt(Exception):
+    """Send ledger file exists but is unusable: unparseable JSON, a
+    non-object top level, or unreadable for a reason other than
+    'not there yet'. Callers must fail closed on this — never fall
+    back to an empty ledger, because an empty ledger forgets every
+    recorded success and the next retry of an old key would send with
+    a fresh client_id the server cannot dedupe against."""
+
+
 def _load_send_ledger():
-    """key -> {client_id, at, result}. A corrupt file reads as empty and
-    is rebuilt on the next successful record — never crash a send."""
+    """key -> {client_id, at, result}. A missing file reads as empty
+    (fresh deploy). Anything else unusable raises LedgerCorrupt.
+
+    The corrupt file is deliberately left in place for operator
+    inspection — do NOT auto-quarantine-and-continue: quarantining and
+    then proceeding would make the very next send see an empty ledger
+    again, which is exactly the silent fallback this refuses. Manual
+    recovery: inspect the file, then move it away; the ledger rebuilds
+    empty, and the old keys' dedupe history is lost with it — the
+    accepted cost of a human intervening on a damaged file."""
     try:
         with open(SEND_LEDGER_FILE) as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError) as e:
+        raise LedgerCorrupt(f"send ledger unreadable: {e}")
+    if not isinstance(data, dict):
+        raise LedgerCorrupt("send ledger is not an object")
+    return data
 
 
 def _record_send_ledger(key, client_id):
@@ -901,7 +922,10 @@ def _ledger_entry_is_fresh(ent):
 
 
 def _check_send_ledger(key):
-    """Return the recorded entry for key if it is a fresh success, else None."""
+    """Return the recorded entry for key if it is a fresh success, else None.
+    Propagates LedgerCorrupt: no current caller uses this (sends go
+    through _resolve_send_intent), but a corrupt ledger must never be
+    reported as 'not sent' from any entry point."""
     if not key:
         return None
     ent = _load_send_ledger().get(key)
@@ -942,8 +966,15 @@ def _send_ledger_lock():
     write, API call and result marking — so two processes racing on the
     same key cannot both decide 'not sent yet'. Re-entrant within one
     thread (the decorator below and the helpers share it); across
-    processes/threads fcntl serializes. Where fcntl is unavailable the
-    lock is a no-op and only the intent/client_id reuse still applies."""
+    processes/threads fcntl serializes.
+
+    Fail-closed, with one platform exception: where fcntl is
+    unavailable (non-POSIX platforms) the lock is a no-op and only the
+    intent/client_id reuse still applies — documented, not silent, and
+    the only case that degrades. Where fcntl IS available but opening
+    the lock file or flock fails, this raises instead of proceeding
+    unlocked: an unlocked keyed send could race another process into
+    the same 'not sent yet' decision the lock exists to prevent."""
     state = _ledger_lock_state
     if getattr(state, "depth", 0) > 0:
         state.depth += 1
@@ -961,7 +992,7 @@ def _send_ledger_lock():
         except Exception:
             if fd is not None:
                 os.close(fd)
-            fd = None
+            raise
     state.depth = 1
     try:
         yield
@@ -978,7 +1009,12 @@ def _keyed_send_locked(func):
     """Decorator: a call carrying a --key runs entirely inside the
     ledger lock; keyless sends are untouched (no lock, no behaviour
     change). The key is the function's `key` argument, positional or
-    keyword."""
+    keyword. A lock-acquire failure aborts the send before any ledger
+    read or API call: LOCK_ERROR, exit 1, audit row — never an
+    unlocked send. (Only the acquire step is converted; exceptions
+    from the send itself are the function's own to report, and
+    release-step failures are best-effort — the lock was held for
+    the whole critical section either way.)"""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         try:
@@ -988,8 +1024,26 @@ def _keyed_send_locked(func):
             key = kwargs.get("key")
         if not key:
             return func(*args, **kwargs)
-        with _send_ledger_lock():
+        lock = _send_ledger_lock()
+        try:
+            lock.__enter__()
+        except Exception as e:
+            direction = {"cmd_send": "send", "cmd_proactive": "proactive",
+                         "cmd_send_media": "media",
+                         "cmd_proactive_media": "media"}.get(
+                             func.__name__, "send")
+            to_user_id = args[0] if args else None
+            _audit_send(direction, to_user_id, None, "lock_error",
+                        error=type(e).__name__)
+            print(f"LOCK_ERROR:{e}")
+            return 1
+        try:
             return func(*args, **kwargs)
+        finally:
+            try:
+                lock.__exit__(None, None, None)
+            except Exception:
+                pass
     return wrapper
 
 
@@ -1025,6 +1079,10 @@ def _resolve_send_intent(key):
 
 def _mark_send_ledger_sent(key, client_id):
     """Flip a key's intent to 'sent' after a confirmed success.
+    Raises on write failure, and also on a corrupt ledger load (the
+    load happens here too, so a damaged file surfaces through the
+    same caller path): either way the caller reports LEDGER_WRITE_FAILED,
+    not success, per the unconfirmed-send semantics below.
     Raises on write failure: the caller must NOT report success then,
     because the ledger still says 'intent'. The caller reports the
     send as unconfirmed (nonzero exit, no SEND_OK), so its driver does
@@ -1080,6 +1138,15 @@ def cmd_proactive(to_user_id, text, key=None):
     if key:
         try:
             client_id, already_sent = _resolve_send_intent(key)
+        except LedgerCorrupt as e:
+            # Ledger unusable: fail closed BEFORE any API call.
+            # Falling back to an empty ledger here would forget
+            # recorded successes and let a retry resend under a
+            # fresh client_id the server cannot dedupe against.
+            _audit_send("proactive", to_user_id, None, "ledger_error",
+                        error=type(e).__name__)
+            print(f"LEDGER_CORRUPT:{e}")
+            return 1
         except Exception as e:
             # Intent not persisted: abort BEFORE any API call. Sending
             # now would use a client_id no retry could reuse.
@@ -1165,6 +1232,15 @@ def cmd_send(to_user_id, context_token, text, key=None):
     if key:
         try:
             client_id, already_sent = _resolve_send_intent(key)
+        except LedgerCorrupt as e:
+            # Ledger unusable: fail closed BEFORE any API call.
+            # Falling back to an empty ledger here would forget
+            # recorded successes and let a retry resend under a
+            # fresh client_id the server cannot dedupe against.
+            _audit_send("send", to_user_id, None, "ledger_error",
+                        error=type(e).__name__)
+            print(f"LEDGER_CORRUPT:{e}")
+            return 1
         except Exception as e:
             # Intent not persisted: abort BEFORE any API call. Sending
             # now would use a client_id no retry could reuse.
@@ -1402,6 +1478,15 @@ def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, k
     if key:
         try:
             client_id, already_sent = _resolve_send_intent(key)
+        except LedgerCorrupt as e:
+            # Ledger unusable: fail closed BEFORE any API call.
+            # Falling back to an empty ledger here would forget
+            # recorded successes and let a retry resend under a
+            # fresh client_id the server cannot dedupe against.
+            _audit_send("media", to_user_id, None, "ledger_error",
+                        error=type(e).__name__)
+            print(f"LEDGER_CORRUPT:{e}")
+            return 1
         except Exception as e:
             # Intent not persisted: abort BEFORE any read or API call.
             _audit_send("media", to_user_id, None, "ledger_error",
@@ -1476,6 +1561,15 @@ def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
     if key:
         try:
             client_id, already_sent = _resolve_send_intent(key)
+        except LedgerCorrupt as e:
+            # Ledger unusable: fail closed BEFORE any API call.
+            # Falling back to an empty ledger here would forget
+            # recorded successes and let a retry resend under a
+            # fresh client_id the server cannot dedupe against.
+            _audit_send("media", to_user_id, None, "ledger_error",
+                        error=type(e).__name__)
+            print(f"LEDGER_CORRUPT:{e}")
+            return 1
         except Exception as e:
             # Intent not persisted: abort BEFORE any read or API call.
             _audit_send("media", to_user_id, None, "ledger_error",
@@ -1622,14 +1716,21 @@ def cmd_health(offline=False):
     def _queue_count(path):
         """(count, corrupt): a queue file that exists but does not
         parse is corrupt — never report it as empty, or a stuck batch
-        looks like a drained queue."""
+        looks like a drained queue. Same strict shape rule as the hook
+        script's queue_count: top level must be an object and .msgs
+        must be an array. A parseable-but-misshapen file (e.g.
+        {"msgs": "invalid"}) is corrupt too — counting a string's
+        length as a message count used to report phantom backlog."""
         try:
             with open(path) as f:
-                return len(json.load(f).get("msgs") or []), False
+                data = json.load(f)
         except FileNotFoundError:
             return 0, False
         except Exception:
             return 0, True
+        if not isinstance(data, dict) or not isinstance(data.get("msgs"), list):
+            return 0, True
+        return len(data["msgs"]), False
 
     pend_n, pend_corrupt = _queue_count(pend)
     if pend_corrupt:
@@ -1665,6 +1766,19 @@ def cmd_health(offline=False):
                          "(unknown_senders.json)")
     except Exception:
         pass
+    try:
+        _load_send_ledger()
+    except LedgerCorrupt:
+        # Keyed sends fail closed while the ledger is damaged, so this
+        # is a warning, not a snapshot detail: the file is left in
+        # place for inspection, and sends resume only once an operator
+        # has inspected or moved it away.
+        warnings.append(
+            "send ledger is corrupt (unparseable or not an object): "
+            f"{SEND_LEDGER_FILE} — keyed sends abort until it is "
+            "inspected or moved away")
+
+    poll_log = os.path.join(BRIDGE, "poll.log")
 
     poll_log = os.path.join(BRIDGE, "poll.log")
     if os.path.exists(poll_log):
