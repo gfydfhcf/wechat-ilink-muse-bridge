@@ -246,6 +246,25 @@ The data directory defaults to `./data/` and can be overridden with the
   complete `send-voice` implementation (full SILK pipeline) ships in
   this repo and will start working the moment the channel allows it.
   Until then, audio can still be delivered as a file or video message.
+- **Tool-call progress messages don't go through (defined by the
+  protocol, ignored by the channel)**: the iLink protocol does define
+  these — message types 11 (`tool_call_start_item`) and 12
+  (`tool_call_result_item`) — and Tencent's official plugin sends one
+  each time the model calls a tool (a start message and a result message
+  carrying the tool name and a completed/failed/blocked status), meant
+  to render as "calling tool X…" progress in WeChat. Tested (Oct 2026):
+  sending them exactly as the official `reply-progress-sender.ts`
+  constructs them, with the envelope matching the official `send.ts`
+  field by field (message_type=2, message_state=2, tried with and
+  without run_id), the server answered HTTP 200 both times but with an
+  empty body and no message_id; the same envelope carrying plain text
+  returned a message_id normally. Conclusion: the server never creates
+  a message for this item type, so the client has nothing to render —
+  this is the channel not accepting them, not the client failing to
+  display them. Unlike outbound voice (API reports success, client
+  never renders), tool progress fails one step earlier: no message is
+  created at all. No workaround for now; while the worker is busy, the
+  "typing…" indicator remains the only progress signal.
 - **Session lifetime is uncertain**: early community reports suggested
   roughly 24 hours, but in production a single login here has stayed valid
   for 3+ days (Oct 2026); it may vary by account. Expiry means a human has
