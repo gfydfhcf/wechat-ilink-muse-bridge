@@ -100,6 +100,27 @@ keeps a stranger from talking their way onto the allowlist.
 - **Token expiry nags once** — on expiry a marker file is written and the
   user is asked to re-scan exactly once
 
+## Markdown rendering in outbound messages
+
+Text messages the bot sends are rendered as Markdown by the WeChat
+client — no need to convert to plain text first (verified in three
+rounds of live tests on the Android WeChat client, 2026-10-25):
+
+Renders: multi-level headings, bold, italic (`*...*` and `_..._` both
+work, `***...***` is bold italic), inline code, code blocks (with a
+language label, a copy button and syntax highlighting), unordered /
+ordered / nested lists, links, tables, strikethrough, blockquotes,
+horizontal rules.
+
+Does not render: task lists (degrade to bullets with literal `[ ]` /
+`[x]`), image syntax (only the alt text survives, no image — use
+`send-image` / `proactive-image` to send pictures), formulas (the `$`
+delimiters are stripped and the content shows as-is, not as math).
+
+Italic is hard to notice in Chinese text; it was confirmed with English.
+Results above are from the Android WeChat client — other clients /
+versions may differ.
+
 ## How it differs from similar projects
 
 There are already plenty of iLink projects on GitHub: SDKs
