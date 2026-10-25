@@ -193,7 +193,10 @@ else
   # 长轮询一轮（服务端 hold 住最多 35s）
   out=$(python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" poll 2>/dev/null || true)
 
-  if [[ "$out" == NO_TOKEN* ]] || [[ "$out" == TOKEN_EXPIRED* ]]; then
+  if [[ "$out" == TOKEN_STALE* ]]; then
+    # -14 退避窗口内：token 可能自愈，不告警、不记 poll 故障，下轮再看
+    silent "token stale, backoff in progress"
+  elif [[ "$out" == NO_TOKEN* ]] || [[ "$out" == TOKEN_EXPIRED* ]]; then
     exp_since=$(astate exp_since)
     exp_last=$(astate exp_last)
     if [ "$exp_since" -eq 0 ]; then

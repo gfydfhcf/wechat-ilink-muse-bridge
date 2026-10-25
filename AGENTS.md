@@ -187,7 +187,10 @@ python3 ilink.py health            # add --offline to skip the live probe
   When commands report `TOKEN_EXPIRED` / `NO_TOKEN`, ask the user to
   re-scan. With the hook driver, the script's alert loop handles the
   cadence (first notice, hourly repeats, recovery announcement) — don't
-  nag on your own schedule on top of it.
+  nag on your own schedule on top of it. `TOKEN_STALE` is different:
+  a -14 inside the backoff window, meaning the token may self-heal —
+  do NOT ask the user to re-scan; treat it as transient and retry
+  later.
 - The bot only receives messages sent **to the bot**. It cannot read the
   user's main-account chats, contacts, or Moments; the protocol has no
   such endpoints. Do not promise otherwise.

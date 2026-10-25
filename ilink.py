@@ -214,6 +214,218 @@ def download_media_item(item: dict, item_type: int):
     return path
 
 
+MEDIA_PRUNE_MAX_AGE_DAYS = 30  # align with QUOTE_CACHE_TTL: a quoted
+# original expires from the cache after the same window
+MEDIA_PRUNE_MAX_TOTAL_BYTES = 500 * 1024 * 1024
+
+
+def _quote_referenced_media_paths():
+    """(absolute paths, basenames) still referenced by the quote cache.
+    Pruning must never delete a file a live cache entry points at."""
+    try:
+        cache = _load_quote_cache()
+    except Exception:
+        return set(), set()
+    paths = set()
+    for ent in cache.get("by_id", {}).values():
+        p = (ent or {}).get("media_path")
+        if p:
+            paths.add(os.path.abspath(p))
+    return paths, {os.path.basename(p) for p in paths}
+
+
+def cmd_prune_media(max_age_days=MEDIA_PRUNE_MAX_AGE_DAYS,
+                    max_total_bytes=MEDIA_PRUNE_MAX_TOTAL_BYTES,
+                    dry_run=False):
+    """Delete downloaded media older than max_age_days, then oldest-first
+    down to max_total_bytes. Files still referenced by the quote cache
+    are exempt from both passes. Prints PRUNE_OK (or PRUNE_DRY_RUN)
+    deleted=N freed=BYTES skipped=M. A single unreadable/unremovable
+    file is skipped, never fatal."""
+    now = int(time.time())
+    cutoff = now - max_age_days * 86400
+    ref_paths, ref_names = _quote_referenced_media_paths()
+    try:
+        names = os.listdir(MEDIA_DIR)
+    except FileNotFoundError:
+        print("PRUNE_OK deleted=0 freed=0 skipped=0")
+        return 0
+    files = []
+    skipped = 0
+    for name in names:
+        path = os.path.join(MEDIA_DIR, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            skipped += 1
+            continue
+        if not os.path.isfile(path):
+            continue
+        files.append({"path": path, "mtime": int(st.st_mtime),
+                      "size": st.st_size})
+
+    def _exempt(f):
+        return (os.path.abspath(f["path"]) in ref_paths
+                or os.path.basename(f["path"]) in ref_names)
+
+    def _try_remove(f):
+        if dry_run:
+            return True
+        try:
+            os.remove(f["path"])
+        except OSError:
+            return False
+        return True
+
+    deleted = 0
+    freed = 0
+    kept = []
+    for f in files:
+        if f["mtime"] < cutoff and not _exempt(f):
+            if _try_remove(f):
+                deleted += 1
+                freed += f["size"]
+            else:
+                skipped += 1
+                kept.append(f)
+        else:
+            kept.append(f)
+    total = sum(f["size"] for f in kept)
+    if total > max_total_bytes:
+        for f in sorted(kept, key=lambda x: x["mtime"]):
+            if total <= max_total_bytes:
+                break
+            if _exempt(f):
+                continue
+            if _try_remove(f):
+                deleted += 1
+                freed += f["size"]
+                total -= f["size"]
+            else:
+                skipped += 1
+    print(f"{'PRUNE_DRY_RUN' if dry_run else 'PRUNE_OK'} "
+          f"deleted={deleted} freed={freed} skipped={skipped}")
+    return 0
+
+
+# --- Version check ----------------------------------------------------------
+# A deployed bridge notifies its own owner when the repo publishes a new
+# release. Release discipline: bump VERSION here BEFORE tagging the
+# release — a forgotten bump makes every deployment report itself
+# outdated forever, since the check compares this constant with the
+# latest release tag.
+VERSION = "1.2.0"
+VERSION_CHECK_URL = ("https://api.github.com/repos/gfydfhcf/"
+                     "wechat-ilink-muse-bridge/releases/latest")
+VERSION_NOTIFY_FILE = os.path.join(BRIDGE, "version_notify.json")
+
+
+def _parse_version(s):
+    """'v1.2.0' -> (1, 2, 0). Unparseable segments become 0; missing
+    parts pad to three, so '1.2' compares equal to '1.2.0'."""
+    s = (s or "").strip().lstrip("vV")
+    parts = []
+    for seg in s.split(".")[:3]:
+        try:
+            parts.append(int(seg))
+        except ValueError:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _compare_versions(a, b):
+    """-1 if a<b, 0 if equal, 1 if a>b (numeric segments only)."""
+    pa, pb = _parse_version(a), _parse_version(b)
+    return (pa > pb) - (pa < pb)
+
+
+def _fetch_latest_release_tag():
+    """Return the latest release tag_name, or None on any failure
+    (never raises: a background check must not crash the caller)."""
+    try:
+        req = urllib.request.Request(
+            VERSION_CHECK_URL,
+            headers={"User-Agent": "wechat-ilink-muse-bridge"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+        tag = data.get("tag_name")
+        return tag if tag else None
+    except Exception:
+        return None
+
+
+def _primary_owner_id():
+    """First owner_id in owner.json (list order = primary account
+    first), falling back to the legacy single owner_id."""
+    try:
+        with open(os.path.join(BRIDGE, "owner.json")) as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    ids = data.get("owner_ids") or []
+    if ids:
+        return ids[0]
+    return data.get("owner_id")
+
+
+def cmd_version_check(notify=False):
+    """Compare local VERSION with the upstream latest release tag.
+    Prints UP_TO_DATE, UPDATE_AVAILABLE:<tag>, or
+    VERSION_CHECK_FAILED. With --notify and an update available that
+    was not already notified for this tag, sends one proactive
+    notification to the owner and records the tag, so each release
+    notifies at most once."""
+    tag = _fetch_latest_release_tag()
+    if not tag:
+        print("VERSION_CHECK_FAILED")
+        return 1
+    if _compare_versions(VERSION, tag) >= 0:
+        print("UP_TO_DATE")
+        return 0
+    print(f"UPDATE_AVAILABLE:{tag}")
+    if not notify:
+        return 0
+    notified = {}
+    try:
+        with open(VERSION_NOTIFY_FILE) as f:
+            notified = json.load(f)
+    except Exception:
+        notified = {}
+    if notified.get("last_notified_tag") == tag:
+        return 0
+    contacts = load_contacts()
+    candidates = []
+    primary = _primary_owner_id()
+    if primary:
+        candidates.append(primary)
+    candidates.extend(sorted(load_owner_ids()))
+    target = None
+    for owner in candidates:
+        if (contacts.get(owner) or {}).get("context_token"):
+            target = owner
+            break
+    if not target:
+        print("NO_CONTEXT_TOKEN")
+        return 1
+    code = cmd_proactive(
+        target,
+        f"微信桥有新版了：{tag}（当前 {VERSION}），去仓库看看更新内容再升级。")
+    if code != 0:
+        return code
+    try:
+        tmp = VERSION_NOTIFY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"last_notified_tag": tag,
+                       "checked_at": int(time.time())}, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, VERSION_NOTIFY_FILE)
+    except Exception:
+        pass
+    return 0
+
+
 def load_contacts():
     if os.path.exists(CONTACTS_FILE):
         try:
@@ -793,8 +1005,14 @@ def save_session(s):
     os.replace(tmp, SESSION_FILE)
 
 
-def cmd_qrcode():
-    data = api("GET", "ilink/bot/get_bot_qrcode?bot_type=3")
+def _fetch_qrcode():
+    """Fetch a fresh QR code. Returns the raw get_bot_qrcode response."""
+    return api("GET", "ilink/bot/get_bot_qrcode?bot_type=3")
+
+
+def _print_qrcode(data):
+    """Print a fetched QR code in cmd_qrcode's format. Returns the
+    qrcode string, for the login loop's auto-refresh."""
     qrcode = data["qrcode"]
     img = data.get("qrcode_img_content", "")
     if img.startswith("data:image/"):
@@ -809,13 +1027,61 @@ def cmd_qrcode():
     elif img.startswith("http"):
         print(f"QR_URL:{img}")
     print(f"QR_CODE:{qrcode}")
+    return qrcode
+
+
+def cmd_qrcode():
+    _print_qrcode(_fetch_qrcode())
+
+
+def _save_login_session(st):
+    s = load_session()
+    s["bot_token"] = st["bot_token"]
+    s["baseurl"] = st.get("baseurl", "")
+    s["login_at"] = int(time.time())
+    save_session(s)
+
+
+def _follow_login_redirect(redirect):
+    """Follow one server-driven login redirect. Returns the parsed JSON
+    dict, or {} when the follow fails or yields nothing parseable.
+    Absolute URLs go direct; relative paths go through api()."""
+    try:
+        if redirect.startswith("http"):
+            req = urllib.request.Request(redirect, method="GET")
+            with urllib.request.urlopen(req, timeout=35) as resp:
+                return json.loads(resp.read().decode())
+        return api("GET", redirect, timeout=35)
+    except Exception:
+        return {}
 
 
 def cmd_login(qrcode, wait_secs=300):
+    """Wait for a QR scan to confirm. Beyond the old confirmed /
+    expired / canceled / timeout handling, this also covers the
+    branches the old loop could only time out or fail on (none of
+    them has ever triggered in production, so all of this is
+    defensive — the confirmed path is unchanged):
+    - expired: auto-refresh the QR code (max 3 refreshes) and keep
+      waiting instead of failing outright;
+    - binded / binded_redirect: the account is already bound; with a
+      bot_token present this is a success, not a failure;
+    - redirect / redirect_url: follow it once per round, and accept a
+      confirmed result from the followed response;
+    - need_verify / verify_url: print the verification URL for the
+      operator to complete in WeChat and keep polling; when the server
+      explicitly asks for a typed code, read one line from stdin and
+      resubmit it with the next status poll (best-effort: a server
+      that ignores the parameter just keeps polling as before)."""
     deadline = time.time() + wait_secs
+    refreshes = 0
+    verify_code = None
     while time.time() < deadline:
         try:
-            st = api("GET", f"ilink/bot/get_qrcode_status?qrcode={qrcode}", timeout=35)
+            url = f"ilink/bot/get_qrcode_status?qrcode={qrcode}"
+            if verify_code:
+                url += f"&verify_code={verify_code}"
+            st = api("GET", url, timeout=35)
         except Exception as e:
             print(f"STATUS_ERROR:{e}", flush=True)
             time.sleep(3)
@@ -823,19 +1089,115 @@ def cmd_login(qrcode, wait_secs=300):
         status = st.get("status")
         print(f"SCAN_STATUS:{status}", flush=True)
         if status == "confirmed":
-            s = load_session()
-            s["bot_token"] = st["bot_token"]
-            s["baseurl"] = st.get("baseurl", "")
-            s["login_at"] = int(time.time())
-            save_session(s)
+            _save_login_session(st)
             print("LOGIN_OK")
             return 0
-        if status in ("expired", "canceled"):
+        if status == "binded" or st.get("binded_redirect"):
+            if st.get("bot_token"):
+                _save_login_session(st)
+                print("LOGIN_OK")
+                return 0
+            print("LOGIN_FAILED:binded_no_token")
+            return 1
+        redirect = st.get("redirect") or st.get("redirect_url")
+        if redirect:
+            print(f"LOGIN_REDIRECT:{redirect}", flush=True)
+            followed = _follow_login_redirect(redirect)
+            if (isinstance(followed, dict)
+                    and followed.get("status") == "confirmed"
+                    and followed.get("bot_token")):
+                _save_login_session(followed)
+                print("LOGIN_OK")
+                return 0
+            time.sleep(2)
+            continue
+        if (status in ("need_verify", "verify", "verify_code")
+                or st.get("verify_url") or st.get("need_verify_code")):
+            if st.get("verify_url"):
+                print(f"VERIFY_URL:{st['verify_url']}", flush=True)
+            if st.get("need_verify_code") or status == "verify_code":
+                try:
+                    print("VERIFY_CODE_REQUIRED: type the code and press Enter",
+                          flush=True)
+                    code = sys.stdin.readline().strip()
+                except Exception:
+                    code = ""
+                verify_code = code or None
+            time.sleep(2)
+            continue
+        if status == "expired":
+            if refreshes >= 3:
+                print("LOGIN_FAILED:expired")
+                return 1
+            refreshes += 1
+            try:
+                data = _fetch_qrcode()
+            except Exception as e:
+                print(f"QR_REFRESH_ERROR:{e}", flush=True)
+                return 1
+            qrcode = _print_qrcode(data)
+            deadline = time.time() + wait_secs
+            continue
+        if status == "canceled":
             print(f"LOGIN_FAILED:{status}")
             return 1
         time.sleep(2)
     print("LOGIN_TIMEOUT")
     return 1
+
+
+# --- Token stale backoff ------------------------------------------------------
+# The official session-guard treats code -14 as "stale", not "expired":
+# pause, retry with the same token, and only declare expiry if -14
+# persists. Our previous behavior alerted "rescan now" on the first -14,
+# so a transient server-side hiccup would have sent the owner to
+# re-scan for nothing. Now a -14 inside the window reports TOKEN_STALE
+# (the hook stays silent and keeps polling); only a -14 streak longer
+# than the window reports TOKEN_EXPIRED. Any successful call clears the
+# marker, so a self-healed token starts a fresh window next time.
+TOKEN_STALE_FILE = os.path.join(BRIDGE, "token_stale.json")
+TOKEN_STALE_WINDOW = 3600
+
+
+def _note_token_stale():
+    """Record a -14 sighting. Returns seconds since the first -14 in
+    the current streak (0 on the first sighting)."""
+    now = int(time.time())
+    try:
+        with open(TOKEN_STALE_FILE) as f:
+            first = int(json.load(f).get("first_seen", now))
+    except Exception:
+        first = now
+    try:
+        tmp = TOKEN_STALE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"first_seen": first}, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, TOKEN_STALE_FILE)
+    except Exception:
+        pass
+    return now - first
+
+
+def _clear_token_stale():
+    """Drop the stale marker: a successful call proves the token is
+    healthy again."""
+    try:
+        os.remove(TOKEN_STALE_FILE)
+    except OSError:
+        pass
+
+
+def _report_token_status():
+    """Map a -14 to its report: TOKEN_STALE (exit 3) inside the backoff
+    window, TOKEN_EXPIRED (exit 2) once the window elapsed. Prints the
+    marker and returns the exit code."""
+    if _note_token_stale() < TOKEN_STALE_WINDOW:
+        print("TOKEN_STALE")
+        return 3
+    _clear_token_stale()
+    print("TOKEN_EXPIRED")
+    return 2
 
 
 def cmd_poll():
@@ -853,8 +1215,9 @@ def cmd_poll():
         print(f"POLL_ERROR:{e}")
         return 1
     if data.get("code") == -14:
-        print("TOKEN_EXPIRED")
-        return 2
+        return _report_token_status()
+    if data.get("code", 0) == 0:
+        _clear_token_stale()
     new_buf = data.get("get_updates_buf") or buf
     fresh, new_ids = filter_seen(data.get("msgs") or [])
     owners = load_owner_ids()
@@ -1389,8 +1752,7 @@ def cmd_proactive(to_user_id, text, key=None):
                 "app_error" if retry else "ok",
                 elapsed_ms=int((time.time() - t0) * 1000), attempt=1)
     if _classify_send_response(data) == "token_expired":
-        print("TOKEN_EXPIRED")
-        return 2
+        return _report_token_status()
     if retry:
         # context_token 可能过期，去掉 token 重试一次
         print(f"RETRY_WITHOUT_TOKEN:{str(data.get('errmsg', ''))[:80]}", flush=True)
@@ -1407,8 +1769,7 @@ def cmd_proactive(to_user_id, text, key=None):
                     elapsed_ms=int((time.time() - t0) * 1000), attempt=2)
         code = data.get("code", 0)
         if code == -14:
-            print("TOKEN_EXPIRED")
-            return 2
+            return _report_token_status()
         if code != 0:
             print(f"PROACTIVE_FAILED:{str(data)[:200]}")
             return 1
@@ -1430,6 +1791,7 @@ def cmd_proactive(to_user_id, text, key=None):
         _quote_cache_upsert({str(data["message_id"]): {
             "text": text, "kind": "text", "from": "bot",
             "at": int(time.time())}})
+    _clear_token_stale()
     print("PROACTIVE_OK")
     return 0
 
@@ -1500,8 +1862,7 @@ def cmd_send(to_user_id, context_token, text, key=None):
                     "ok" if outcome == "ok" else "app_error",
                     elapsed_ms=int((time.time() - t0) * 1000), attempt=attempt)
         if outcome == "token_expired":
-            print("TOKEN_EXPIRED")
-            return 2
+            return _report_token_status()
         if outcome != "ok":
             print(f"SEND_FAILED:{str(data)[:200]}")
             return 1
@@ -1523,6 +1884,7 @@ def cmd_send(to_user_id, context_token, text, key=None):
             _quote_cache_upsert({str(data["message_id"]): {
                 "text": text, "kind": "text", "from": "bot",
                 "at": int(time.time())}})
+        _clear_token_stale()
         print("SEND_OK")
         return 0
 
@@ -1647,10 +2009,14 @@ def _upload_media(to_user_id, data, media_type, token):
     }
     r = api("POST", "ilink/bot/getuploadurl", body, token=token, timeout=20)
     upload_param = r.get("upload_param")
-    if not upload_param:
+    full_url = r.get("upload_full_url")
+    if not upload_param and not full_url:
         raise RuntimeError(f"getuploadurl no upload_param: {str(r)[:200]}")
-    url = (f"{CDN_BASE_URL}/upload?encrypted_query_param="
-           f"{quote(upload_param, safe='')}&filekey={filekey}")
+    # Prefer a server-provided full upload URL when present; fall back
+    # to the constructed CDN URL otherwise.
+    url = full_url or (
+        f"{CDN_BASE_URL}/upload?encrypted_query_param="
+        f"{quote(upload_param, safe='')}&filekey={filekey}")
     req = urllib.request.Request(url, data=ciphertext, method="POST",
                                  headers={"Content-Type": "application/octet-stream"})
     with urllib.request.urlopen(req, timeout=120) as resp:
@@ -1753,8 +2119,7 @@ def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, k
                 "ok" if outcome == "ok" else "app_error",
                 elapsed_ms=int((time.time() - t0) * 1000))
     if outcome == "token_expired":
-        print("TOKEN_EXPIRED")
-        return 2
+        return _report_token_status()
     if outcome != "ok":
         print(f"SEND_FAILED:{str(data_resp)[:200]}")
         return 1
@@ -1777,6 +2142,7 @@ def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, k
             "kind": ITEM_TYPE_NAMES.get(media_type, "file"),
             "from": "bot", "at": int(time.time()),
             "media_path": path}})
+    _clear_token_stale()
     print("SEND_OK")
     return 0
 
@@ -1843,8 +2209,7 @@ def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
                 "ok" if outcome == "ok" else "app_error",
                 elapsed_ms=int((time.time() - t0) * 1000), attempt=1)
     if outcome == "token_expired":
-        print("TOKEN_EXPIRED")
-        return 2
+        return _report_token_status()
     if outcome != "ok":
         try:
             t0 = time.time()
@@ -1860,8 +2225,7 @@ def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
                     "ok" if outcome == "ok" else "app_error",
                     elapsed_ms=int((time.time() - t0) * 1000), attempt=2)
         if outcome == "token_expired":
-            print("TOKEN_EXPIRED")
-            return 2
+            return _report_token_status()
         if outcome != "ok":
             print(f"PROACTIVE_FAILED:{str(data_resp)[:200]}")
             return 1
@@ -1884,6 +2248,7 @@ def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
             "kind": ITEM_TYPE_NAMES.get(media_type, "file"),
             "from": "bot", "at": int(time.time()),
             "media_path": path}})
+    _clear_token_stale()
     print("PROACTIVE_OK")
     return 0
 
@@ -2087,6 +2452,19 @@ def main(argv):
         return cmd_commit()
     if cmd == "health":
         return cmd_health(offline="--offline" in argv)
+    if cmd == "prune-media":
+        dry_run = "--dry-run" in argv
+        age = MEDIA_PRUNE_MAX_AGE_DAYS
+        total_mb = MEDIA_PRUNE_MAX_TOTAL_BYTES // (1024 * 1024)
+        args = [a for a in argv[2:] if a != "--dry-run"]
+        for i, a in enumerate(args):
+            if a == "--max-age-days" and i + 1 < len(args):
+                age = int(args[i + 1])
+            if a == "--max-total-mb" and i + 1 < len(args):
+                total_mb = int(args[i + 1])
+        return cmd_prune_media(age, total_mb * 1024 * 1024, dry_run)
+    if cmd == "version-check":
+        return cmd_version_check(notify="--notify" in argv)
     if cmd == "send":
         if not _need(argv, 5, "ilink.py send <to> <ctx> <text> [--key <id>]"):
             return 2
