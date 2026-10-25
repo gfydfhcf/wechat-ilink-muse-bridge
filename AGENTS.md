@@ -94,6 +94,12 @@ atomic `mv`. When woken, handle the batch under this contract:
   the content naturally segments (a reaction, the substance, a
   question) — like a human texting — but never one reply per incoming
   message, and never split a single sentence across bubbles.
+- Quote context: an entry may carry `quoted_text` (the original message
+  being quoted), `quoted_kind`, `quoted_fragment` (start/end characters
+  of a selective quote), and `quoted_media_path` (when the quoted
+  message is media). Treat "this / that message" as referring to
+  `quoted_text`; with only a fragment, go by the fragment; with
+  neither, say the original is not visible instead of guessing it.
 - Replies may use Markdown: the WeChat client renders headings, bold,
   italic, inline code, code blocks (with a language label, copy button
   and syntax highlighting), lists, links, tables, strikethrough,
