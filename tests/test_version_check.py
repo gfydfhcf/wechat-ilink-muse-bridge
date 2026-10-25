@@ -29,6 +29,7 @@ import ilink  # noqa: E402
 
 RELEASE = {"tag": "v1.2.0"}
 SENDS = []
+MSGS = []
 REAL_URL_OPEN = urllib.request.urlopen
 
 
@@ -49,7 +50,11 @@ class FakeResp:
 def fake_urlopen(req, timeout=None):
     if RELEASE["tag"] is None:
         raise OSError("network down")
-    return FakeResp({"tag_name": RELEASE["tag"]})
+    return FakeResp({
+        "tag_name": RELEASE["tag"],
+        "body": "修复了 X 问题\n新增 Y 功能",
+        "html_url": f"https://example.com/releases/{RELEASE['tag']}",
+    })
 
 
 def fake_api(*args, **kwargs):
@@ -57,6 +62,7 @@ def fake_api(*args, **kwargs):
     if "sendmessage" in path:
         body = args[2] if len(args) > 2 else {}
         SENDS.append((body.get("msg") or {}).get("to_user_id"))
+        MSGS.append(body.get("msg") or {})
         return {"code": 0, "message_id": 999}
     raise AssertionError(f"unexpected api call: {path}")
 
@@ -79,6 +85,7 @@ class VersionCheckTest(unittest.TestCase):
         ilink.QUOTE_CACHE_FILE = os.path.join(DATA_DIR, "quote_cache.json")
         ilink.QUOTE_CACHE_LOCK_FILE = os.path.join(DATA_DIR, "quote_cache.lock")
         ilink.VERSION_NOTIFY_FILE = os.path.join(DATA_DIR, "version_notify.json")
+        ilink.UPDATE_OFFER_FILE = os.path.join(DATA_DIR, "update_offer.json")
         for name in os.listdir(DATA_DIR):
             path = os.path.join(DATA_DIR, name)
             if os.path.isfile(path):
@@ -94,6 +101,7 @@ class VersionCheckTest(unittest.TestCase):
         urllib.request.urlopen = fake_urlopen
         RELEASE["tag"] = "v1.2.0"
         SENDS.clear()
+        MSGS.clear()
 
     def tearDown(self):
         urllib.request.urlopen = REAL_URL_OPEN
@@ -131,6 +139,21 @@ class VersionCheckTest(unittest.TestCase):
         with open(ilink.VERSION_NOTIFY_FILE) as f:
             state = json.load(f)
         self.assertEqual(state["notified"], {"owner-1": "v1.3.0"})
+        # Notify text: version, release-notes excerpt, release link,
+        # and the install/postpone question.
+        self.assertEqual(len(MSGS), 1)
+        text = MSGS[0]["item_list"][0]["text_item"]["text"]
+        self.assertIn("v1.3.0", text)
+        self.assertIn("修复了 X 问题", text)
+        self.assertIn("https://example.com/releases/v1.3.0", text)
+        self.assertIn("安装更新", text)
+        self.assertIn("暂时别了", text)
+        # Offer marker: tag + owners + fresh timestamp.
+        with open(os.path.join(DATA_DIR, "update_offer.json")) as f:
+            offer = json.load(f)
+        self.assertEqual(offer["tag"], "v1.3.0")
+        self.assertEqual(offer["owners"], ["owner-1"])
+        self.assertEqual(ilink.UPDATE_OFFER_TTL, 86400)
         # Second run for the same tag sends nothing.
         code, _ = run_check(notify=True)
         self.assertEqual(code, 0)

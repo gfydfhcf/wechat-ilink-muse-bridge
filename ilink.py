@@ -341,19 +341,41 @@ def _compare_versions(a, b):
     return (pa > pb) - (pa < pb)
 
 
-def _fetch_latest_release_tag():
-    """Return the latest release tag_name, or None on any failure
-    (never raises: a background check must not crash the caller)."""
+def _fetch_latest_release():
+    """Return the latest release dict (tag_name, name, body, html_url),
+    or None on any failure (never raises: a background check must not
+    crash the caller)."""
     try:
         req = urllib.request.Request(
             VERSION_CHECK_URL,
             headers={"User-Agent": "wechat-ilink-muse-bridge"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
-        tag = data.get("tag_name")
-        return tag if tag else None
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+
+def _update_notify_text(tag, rel):
+    """Notification text for a new release: version, a short excerpt of
+    the release notes (mechanical truncation to 800 chars, not a
+    curated summary), the release page link, and the install/postpone
+    question."""
+    body = (rel.get("body") or "").strip()
+    excerpt = body[:800]
+    if len(body) > 800:
+        excerpt += "……"
+    lines = [f"微信桥有新版了：{tag}（当前 {VERSION}）。"]
+    if excerpt:
+        lines.append(f"【更新内容】{excerpt}")
+    else:
+        lines.append("【更新内容】（本次无更新说明）")
+    url = rel.get("html_url") or (
+        "https://github.com/gfydfhcf/wechat-ilink-muse-bridge"
+        f"/releases/tag/{tag}")
+    lines.append(f"详情：{url}")
+    lines.append("回「安装更新」我就在后台装好告诉你，回「暂时别了」就先不装。")
+    return "\n".join(lines)
 
 
 def _load_version_notify():
@@ -438,8 +460,12 @@ def cmd_version_check(notify=False):
     cached context_token and was not already notified for this tag.
     Unsubscribed owners are never notified. A failed send is not
     recorded, so the next check retries it (an offline bot's notice is
-    deferred, not lost)."""
-    tag = _fetch_latest_release_tag()
+    deferred, not lost). With --notify, the message also carries a
+    release-notes excerpt and the install question, and a successful
+    send writes an update_offer marker (tag, owners, time) that the
+    worker uses to recognize an affirmative reply as 'install it'."""
+    rel = _fetch_latest_release()
+    tag = (rel or {}).get("tag_name")
     if not tag:
         print("VERSION_CHECK_FAILED")
         return 1
@@ -466,21 +492,267 @@ def cmd_version_check(notify=False):
         return 1
     sent_any = False
     last_code = 0
+    sent_owners = []
+    text = _update_notify_text(tag, rel)
     for owner in reachable:
-        code = cmd_proactive(
-            owner,
-            f"微信桥有新版了：{tag}（当前 {VERSION}），去仓库看看更新内容再升级。")
+        code = cmd_proactive(owner, text)
         if code == 0:
             notified[owner] = tag
             sent_any = True
+            sent_owners.append(owner)
         else:
             last_code = code
     state["subscribed"] = subscribed
     state["notified"] = notified
     state["checked_at"] = int(time.time())
     _save_version_notify(state)
+    if sent_any:
+        _write_update_offer(tag, sent_owners)
     if not sent_any:
         return last_code or 1
+    return 0
+
+
+UPDATE_OFFER_FILE = os.path.join(BRIDGE, "update_offer.json")
+UPDATE_OFFER_TTL = 86400
+
+
+def _write_update_offer(tag, owners):
+    """Record that these owners were offered this tag, so the worker
+    can recognize a fresh affirmative reply as 'install it'.
+    Best-effort: a failed write just means no recognition window."""
+    try:
+        _save_json_atomic(UPDATE_OFFER_FILE,
+                          {"tag": tag, "owners": list(owners),
+                           "offered_at": int(time.time())})
+    except Exception:
+        pass
+
+
+def _clear_update_offer():
+    try:
+        os.remove(UPDATE_OFFER_FILE)
+    except OSError:
+        pass
+
+
+# --- Self-update --------------------------------------------------------------
+# update-to installs a RELEASE tag (never main, never an arbitrary URL):
+# ilink.py always; hook scripts when --hook-dir names the deployed hook
+# directory and the release changed them; AGENTS.md is NEVER applied
+# automatically — a changed contract is downloaded to
+# BRIDGE/AGENTS.md.new for manual sync, and the post-update message must
+# say so (see the worker contract in AGENTS.md). Two phases: download +
+# verify everything first, then swap everything (backups kept as
+# .bak-<tag>). Any verification failure replaces nothing. State files
+# (session, owner, contacts, ledgers, caches) are never touched.
+UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/gfydfhcf/"
+                   "wechat-ilink-muse-bridge")
+UPDATE_COMPARE_URL = ("https://api.github.com/repos/gfydfhcf/"
+                      "wechat-ilink-muse-bridge/compare")
+HOOK_SCRIPT_FILES = ("ilink-watch.sh", "ilink-warm-wait.sh")
+
+
+def _github_get_json(url):
+    """GET a GitHub URL and parse JSON, or None on any failure."""
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "wechat-ilink-muse-bridge"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+    except Exception:
+        return None
+
+
+def _github_get_text(url):
+    """GET a URL as text, or None on any failure."""
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "wechat-ilink-muse-bridge"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read().decode("utf-8")
+    except Exception:
+        return None
+
+
+def _extract_version(source):
+    """VERSION = "..." from ilink.py source, or None."""
+    m = re.search(r"^VERSION\s*=\s*\"([^\"]+)\"", source, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def _verify_python_source(source):
+    """Compile check only (no execution). Returns error string or None."""
+    try:
+        compile(source, "<downloaded>", "exec")
+    except Exception as e:
+        return str(e)
+    return None
+
+
+def _verify_shell_source(source):
+    """bash -n check via a temp file. Returns error string or None."""
+    import subprocess
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".sh",
+                                         delete=False) as f:
+            f.write(source)
+            tmp = f.name
+        try:
+            r = subprocess.run(["bash", "-n", tmp],
+                               capture_output=True, timeout=30)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if r.returncode != 0:
+            return (r.stderr.decode("utf-8", "replace").strip()
+                    or "bash -n failed")
+    except Exception as e:
+        return str(e)
+    return None
+
+
+def _copy_file(src, dst):
+    with open(src, "rb") as f_in, open(dst, "wb") as f_out:
+        f_out.write(f_in.read())
+
+
+def cmd_update_to(tag, hook_dir=None, script_path=None):
+    """Install release <tag>. Prints UPDATE_OK:<tag> plus per-file
+    lines, or UPDATE_FAILED:<reason> (with ROLLED_BACK when a post-swap
+    failure restored the backups). UP_TO_DATE when already on the tag;
+    refuses older tags (never downgrade) and tags with '/' or '..'.
+    script_path defaults to the running script file (tests pass a temp
+    path so the repo file is never touched)."""
+    tag = (tag or "").strip()
+    if not tag or "/" in tag or ".." in tag:
+        print("UPDATE_FAILED:bad_tag")
+        return 1
+    cmp = _compare_versions(VERSION, tag)
+    if cmp >= 0:
+        if cmp == 0:
+            print("UP_TO_DATE")
+            return 0
+        print("UPDATE_FAILED:not_newer")
+        return 1
+    if script_path is None:
+        script_path = os.path.abspath(__file__)
+    head = tag if tag[:1] in ("v", "V") else "v" + tag
+    base = VERSION if VERSION[:1] in ("v", "V") else "v" + VERSION
+    compare = _github_get_json(f"{UPDATE_COMPARE_URL}/{base}...{head}")
+    changed = set()
+    compare_ok = False
+    if isinstance(compare, dict) and isinstance(compare.get("files"), list):
+        compare_ok = True
+        for f in compare["files"]:
+            name = f.get("filename")
+            if name:
+                changed.add(name)
+    # Phase 1: download + verify everything.
+    plan = []  # (kind, target_path, content)
+    src = _github_get_text(f"{UPDATE_RAW_BASE}/{head}/ilink.py")
+    if src is None:
+        print("UPDATE_FAILED:download")
+        return 1
+    err = _verify_python_source(src)
+    if err:
+        print(f"UPDATE_FAILED:verify:ilink.py:{err[:200]}")
+        return 1
+    file_version = _extract_version(src)
+    if file_version is None or _compare_versions(file_version, tag) != 0:
+        # Also enforces release discipline: a tag whose ilink.py was
+        # not bumped to the tag refuses to install.
+        print("UPDATE_FAILED:verify:version_mismatch")
+        return 1
+    plan.append(("ilink.py", script_path, src))
+    script_lines = []
+    if hook_dir and not compare_ok:
+        script_lines.append("SKIPPED:hook-scripts:compare-unavailable")
+    elif hook_dir:
+        for name in HOOK_SCRIPT_FILES:
+            target = os.path.join(hook_dir, name)
+            repo_path = f"examples/muse-hook/{name}"
+            if repo_path not in changed:
+                script_lines.append(f"SKIPPED:{name}:unchanged")
+                continue
+            if not os.path.isfile(target):
+                script_lines.append(f"SKIPPED:{name}:missing")
+                continue
+            content = _github_get_text(
+                f"{UPDATE_RAW_BASE}/{head}/{repo_path}")
+            if content is None:
+                print("UPDATE_FAILED:download")
+                return 1
+            err = _verify_shell_source(content)
+            if err:
+                print(f"UPDATE_FAILED:verify:{name}:{err[:200]}")
+                return 1
+            plan.append((name, target, content))
+    elif compare_ok and any(f"examples/muse-hook/{n}" in changed
+                            for n in HOOK_SCRIPT_FILES):
+        script_lines.append("SKIPPED:hook-scripts:no-hook-dir")
+    contract_line = None
+    if compare_ok and "AGENTS.md" in changed:
+        content = _github_get_text(f"{UPDATE_RAW_BASE}/{head}/AGENTS.md")
+        if content:
+            plan.append(("AGENTS.md.new",
+                         os.path.join(BRIDGE, "AGENTS.md.new"), content))
+            contract_line = "CONTRACT:AGENTS.md.new"
+    # Phase 2: backup + atomic swap, then re-verify from disk.
+    backed = []  # (target, backup_path or None)
+    try:
+        for kind, target, content in plan:
+            backup = None
+            if os.path.exists(target):
+                backup = target + f".bak-{head}"
+                _copy_file(target, backup)
+            backed.append((target, backup))
+            tmp = target + f".tmp-update-{os.getpid()}"
+            try:
+                mode = os.stat(target).st_mode & 0o777
+            except OSError:
+                mode = 0o644
+            with open(tmp, "w") as f:
+                f.write(content)
+            os.chmod(tmp, mode)
+            os.replace(tmp, target)
+        with open(script_path) as f:
+            err = _verify_python_source(f.read())
+        if err:
+            raise RuntimeError(f"post-verify ilink.py: {err}")
+        for kind, target, content in plan:
+            if kind in HOOK_SCRIPT_FILES:
+                with open(target) as f:
+                    err = _verify_shell_source(f.read())
+                if err:
+                    raise RuntimeError(f"post-verify {kind}: {err}")
+    except Exception as e:
+        for target, backup in backed:
+            try:
+                if backup:
+                    os.replace(backup, target)
+                else:
+                    os.remove(target)
+            except OSError:
+                pass
+        print(f"UPDATE_FAILED:swap:{e}")
+        print("ROLLED_BACK")
+        return 1
+    _clear_update_offer()
+    print(f"UPDATE_OK:{head}")
+    for kind, target, content in plan:
+        if kind == "AGENTS.md.new":
+            continue
+        print(f"UPDATED:{kind}")
+    for line in script_lines:
+        print(line)
+    if contract_line:
+        print(contract_line)
+    if not compare_ok:
+        print("COMPARE:unavailable")
     return 0
 
 
@@ -2530,6 +2802,15 @@ def main(argv):
         return cmd_prune_media(age, total_mb * 1024 * 1024, dry_run)
     if cmd == "version-check":
         return cmd_version_check(notify="--notify" in argv)
+    if cmd == "update-to":
+        if not _need(argv, 3, "ilink.py update-to <tag> [--hook-dir <dir>]"):
+            return 2
+        hook_dir = None
+        args = argv[3:]
+        for i, a in enumerate(args):
+            if a == "--hook-dir" and i + 1 < len(args):
+                hook_dir = args[i + 1]
+        return cmd_update_to(argv[2], hook_dir=hook_dir)
     if cmd == "subscribe":
         if not _need(argv, 3, "ilink.py subscribe <owner_id>"):
             return 2

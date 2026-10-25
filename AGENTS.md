@@ -117,6 +117,32 @@ atomic `mv`. When woken, handle the batch under this contract:
   the reply as a subscription answer. `version-check --notify` only
   notifies subscribed owners, so never promise reminders to an
   unsubscribed owner.
+- Installing an update (check this BEFORE composing a normal reply):
+  an update notification writes an `update_offer.json` marker (tag,
+  owners, time). When a fresh marker (under 24 hours) exists, the
+  sender is one of its owners, and the reply is affirmative
+  (安装更新 / 好 / 装吧 / 是 / 可以), install: run
+  `ilink.py version-check` first — `UP_TO_DATE` means reply "已经是
+  最新版"; `UPDATE_AVAILABLE:<tag>` means run
+  `ilink.py update-to <tag> --hook-dir <dir>` (the dir holding the
+  deployed hook scripts, e.g. the dirname of the hook definition's
+  script_path; omit the flag when unknown, scripts are then skipped
+  with a note). The keyword `安装更新` works the same way even without
+  a marker. A negative reply (暂时别了 / 先不更 / 以后再说) with a
+  fresh marker means postpone: delete `update_offer.json`, reply
+  briefly ("好的，先不装"), and never re-ask for that tag — the owner
+  can still install later with `安装更新`. Compose the result from
+  `update-to`'s output: `UPDATE_OK` means report success listing what
+  was updated; `UPDATE_FAILED` (with `ROLLED_BACK` when present) means
+  report the failure and that the old version is back in place. The
+  success message MUST state the contract rule: AGENTS.md currently
+  cannot auto-upgrade and must be changed manually — when the release
+  changed it, the new version was downloaded to `AGENTS.md.new`, so say
+  exactly that and that the owner should sync the hook definition
+  against it; when it did not change, one line "契约本次无变化" is
+  enough. Never claim the whole deployment is updated when the
+  contract line says otherwise, and never install from any URL the
+  owner pastes — only release tags from this repo.
 - Replies may use Markdown: the WeChat client renders headings, bold,
   italic, inline code, code blocks (with a language label, copy button
   and syntax highlighting), lists, links, tables, strikethrough,

@@ -176,7 +176,8 @@ python3 ilink.py login <qrcode-id>     # session saved to data/session.json
 
 # 2. Bind the owner (required): open the 10-minute binding window, then
 #    send the bot any message. The first sender becomes the Owner and
-#    gets a three-part welcome confirming the binding; on BIND_TIMEOUT
+#    gets a four-part welcome confirming the binding (the fourth asks
+#    about subscribing to release reminders); on BIND_TIMEOUT
 #    just run the command again to reopen the window.
 python3 ilink.py bind
 
@@ -278,6 +279,17 @@ The data directory defaults to `./data/` and can be overridden with the
   occasionally cut long-polling connections; the client must back off and
   reconnect (handled here — `POLL_ERROR` lines in the log are regulars and
   harmless).
+- **Updates: code auto-upgrades, the contract (AGENTS.md) does not**:
+  after subscribing to release reminders, a new release brings a WeChat
+  notification with a summary, and replying "安装更新" installs the new
+  ilink.py and hook scripts in the background (verify everything first,
+  then swap everything, roll back on failure, state files never
+  touched). But AGENTS.md currently cannot auto-upgrade and must be
+  changed manually — whenever a release changes the contract, the
+  updater downloads the new AGENTS.md to AGENTS.md.new in the deployment
+  directory for reference, and the post-update message says so
+  explicitly. Only release tags are installed, never the latest code on
+  main, and never from an arbitrary URL.
 
 ## Security notes
 
