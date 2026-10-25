@@ -21,6 +21,9 @@
 #   - commit 待提交账本：commit 前先把 payload 原子落盘到
 #     ilink-commit-pending.json，成功才删；失败时下一轮开头先补交，
 #     补交成功前不 poll——commit 失败只是延迟，不与重拉交叠出重复处理
+# 存活心跳（2026-10-25）：
+#   - 每轮拿锁成功后 touch ilink-heartbeat；安静轮次不写 poll.log，
+#     唯独心跳能证明 hook 活着，供 ilink.py watchdog 看门
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -38,6 +41,9 @@ exec 9>"$STATE_DIR/ilink-watch.lock"
 if ! flock -n 9; then
   exit 0
 fi
+# 存活心跳：每轮都 touch，看门狗凭它判断 hook 是不是还在跑。
+# 拿不到锁的实例安静退出，不 touch。
+touch "$STATE_DIR/ilink-heartbeat"
 PENDING=$STATE_DIR/ilink-pending.json
 PROC=$STATE_DIR/ilink-processing.json
 WARM=$STATE_DIR/ilink-warm.json

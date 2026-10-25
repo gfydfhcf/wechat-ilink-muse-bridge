@@ -19,6 +19,11 @@ Usage:
   ilink.py proactive-file <to> <path>     # proactive file via cached ctx
   ilink.py health [--offline]  # self-check: auth, queue, last poll (exit 0 ok / 1 warn / 2 bad)
   ilink.py smoke-test [--no-send] [--to <owner>]  # end-to-end chain check: login probe, receive readiness, real text+image to owner, ledger (exit 0 ok / 1 fail)
+  ilink.py watchdog [--max-age-mins N]  # dead-man's switch: hook heartbeat freshness (exit 0 fresh/recovered/disabled, 1 stale)
+  ilink.py rotate-chatlog  # archive past-month chatlog.md lines into chatlog-YYYY-MM.md (exit 0)
+  ilink.py rollback [--hook-dir <dir>]  # restore ilink.py (+ hook scripts) from newest .bak-* backup (exit 0 ok / 1 fail)
+  ilink.py stats  # offline snapshot: today's exchanges/sends, ledger, quote cache, media, session, queue (exit 0)
+  ilink.py preflight  # pre-login env check: Python, cryptography, network, writable dirs (exit 0 ok / 1 fail)
   ilink.py proactive-video <to> <path>    # proactive video via cached ctx
   ilink.py proactive-voice <to> <path> <playtime_ms>   # proactive voice (dropped by channel, see send-voice)
 
@@ -49,6 +54,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 
 try:
@@ -554,6 +560,10 @@ UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/gfydfhcf/"
 UPDATE_COMPARE_URL = ("https://api.github.com/repos/gfydfhcf/"
                       "wechat-ilink-muse-bridge/compare")
 HOOK_SCRIPT_FILES = ("ilink-watch.sh", "ilink-warm-wait.sh")
+# Watchdog default: the hook runs every ~5s, so a heartbeat older than
+# 30 minutes means ~360 missed runs — a near-zero false-positive
+# signal, checked by a 15-minute cron.
+WATCHDOG_MAX_AGE_MINS = 30
 
 
 def _github_get_json(url):
@@ -2604,6 +2614,27 @@ def _fmt_age(seconds):
     return f"{seconds // 86400}d"
 
 
+def _queue_count(path):
+    """(count, corrupt): a queue file that exists but does not
+    parse is corrupt — never report it as empty, or a stuck batch
+    looks like a drained queue. Same strict shape rule as the hook
+    script's queue_count: top level must be an object and .msgs
+    must be an array. A parseable-but-misshapen file (e.g.
+    {"msgs": "invalid"}) is corrupt too — counting a string's
+    length as a message count used to report phantom backlog.
+    Shared by health and stats."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return 0, False
+    except Exception:
+        return 0, True
+    if not isinstance(data, dict) or not isinstance(data.get("msgs"), list):
+        return 0, True
+    return len(data["msgs"]), False
+
+
 def cmd_health(offline=False):
     """Self-check: auth, live token probe, message queue, last poll error.
     Exit code 0 = healthy, 1 = warnings, 2 = broken."""
@@ -2655,25 +2686,6 @@ def cmd_health(offline=False):
                  or os.path.expanduser("~/hooks/state"))
     pend = os.path.join(state_dir, "ilink-pending.json")
     proc = os.path.join(state_dir, "ilink-processing.json")
-
-    def _queue_count(path):
-        """(count, corrupt): a queue file that exists but does not
-        parse is corrupt — never report it as empty, or a stuck batch
-        looks like a drained queue. Same strict shape rule as the hook
-        script's queue_count: top level must be an object and .msgs
-        must be an array. A parseable-but-misshapen file (e.g.
-        {"msgs": "invalid"}) is corrupt too — counting a string's
-        length as a message count used to report phantom backlog."""
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            return 0, False
-        except Exception:
-            return 0, True
-        if not isinstance(data, dict) or not isinstance(data.get("msgs"), list):
-            return 0, True
-        return len(data["msgs"]), False
 
     pend_n, pend_corrupt = _queue_count(pend)
     if pend_corrupt:
@@ -2905,6 +2917,349 @@ def cmd_smoke_test(no_send=False, to_user_id=None):
     return 0
 
 
+def _hook_state_dir():
+    """Canonical hook state dir — same expression and default as
+    cmd_health and the example hook script (ILINK_HOOK_STATE is the
+    legacy alias)."""
+    return (os.environ.get("ILINK_HOOK_STATE_DIR")
+            or os.environ.get("ILINK_HOOK_STATE")
+            or os.path.expanduser("~/hooks/state"))
+
+
+def cmd_watchdog(max_age_mins=WATCHDOG_MAX_AGE_MINS):
+    """Dead-man's switch for the hook driver. The hook touches
+    ilink-heartbeat on every run (quiet runs included — they write
+    nothing to poll.log, so the heartbeat is the only proof the hook
+    is alive). If the heartbeat is older than max_age_mins, or has
+    never existed, the hook is presumed dead. Alert transitions are
+    tracked in ilink-watchdog-state.json so a cron driver stays
+    silent on healthy runs, reports the first stale sighting once
+    (WATCHDOG_ALERT), repeats only as WATCHDOG_STALE, and reports
+    recovery once (WATCHDOG_RECOVERED). A maintenance flag file
+    ilink-watchdog-off silences everything — touch it while the
+    bridge is intentionally stopped, remove it after. Exit 0 when
+    fresh, recovered or disabled; 1 when stale."""
+    state_dir = _hook_state_dir()
+    if os.path.exists(os.path.join(state_dir, "ilink-watchdog-off")):
+        print("WATCHDOG_DISABLED")
+        return 0
+    hb = os.path.join(state_dir, "ilink-heartbeat")
+    now = int(time.time())
+    try:
+        age = now - int(os.stat(hb).st_mtime)
+    except OSError:
+        age = None
+    state_path = os.path.join(state_dir, "ilink-watchdog-state.json")
+    try:
+        with open(state_path) as f:
+            alerted = bool(json.load(f).get("alerted"))
+    except Exception:
+        alerted = False
+
+    def _set_alerted(value):
+        try:
+            tmp = state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"alerted": value}, f)
+            os.replace(tmp, state_path)
+        except Exception:
+            pass
+
+    if age is None or age > max_age_mins * 60:
+        detail = ("no heartbeat yet" if age is None
+                  else f"heartbeat {_fmt_age(age)} old")
+        if not alerted:
+            _set_alerted(True)
+            print(f"WATCHDOG_ALERT:{detail}")
+        else:
+            print(f"WATCHDOG_STALE:{detail}")
+        return 1
+    if alerted:
+        _set_alerted(False)
+        print("WATCHDOG_RECOVERED")
+        return 0
+    print(f"WATCHDOG_OK:heartbeat {_fmt_age(age)} old")
+    return 0
+
+
+def cmd_rotate_chatlog():
+    """Archive chatlog.md lines from past months into per-month files
+    (chatlog-YYYY-MM.md), keeping current-month and undated lines in
+    place. Idempotent: a second run finds nothing old and prints
+    ROTATE_NOTHING. The worker reads the last 30 lines of chatlog.md,
+    which rotation never breaks — current-month lines stay, and
+    archives are named by month for manual lookup. A missing chatlog
+    is ROTATE_NOTHING, not an error. Exit 0 on success or nothing to
+    do, 1 only on a write failure."""
+    path = os.path.join(BRIDGE, "chatlog.md")
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print("ROTATE_NOTHING:no chatlog")
+        return 0
+    cur_month = time.strftime("%Y-%m", time.localtime())
+    keep = []
+    archived = {}
+    for line in lines:
+        m = re.match(r"\[(\d{4}-\d{2})-\d{2}", line)
+        month = m.group(1) if m else None
+        if month and month != cur_month:
+            archived.setdefault(month, []).append(line)
+        else:
+            keep.append(line)
+    if not archived:
+        print("ROTATE_NOTHING:nothing from past months")
+        return 0
+    try:
+        for month, mls in sorted(archived.items()):
+            with open(os.path.join(BRIDGE, f"chatlog-{month}.md"),
+                      "a") as f:
+                f.writelines(mls)
+        tmp = path + ".tmp-rotate"
+        with open(tmp, "w") as f:
+            f.writelines(keep)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"ROTATE_FAILED:{type(e).__name__}")
+        return 1
+    total = sum(len(v) for v in archived.values())
+    print(f"ROTATE_OK:archived {total} line(s) into "
+          f"{len(archived)} month file(s)")
+    return 0
+
+
+def _newest_backup(target):
+    """Newest '<target>.bak-*' file by mtime, or None. Covers both
+    backup schemes: update-to's '.bak-<tag>' and the port script's
+    '.bak-<date>-<label>'. Pre-rollback copies ('.bak-pre-rollback-*')
+    are valid sources too — rolling back twice returns to the state
+    before the first rollback."""
+    d = os.path.dirname(target) or "."
+    base = os.path.basename(target) + ".bak-"
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return None
+    cands = [os.path.join(d, n) for n in names
+             if n.startswith(base) and os.path.isfile(os.path.join(d, n))]
+    if not cands:
+        return None
+    return max(cands, key=lambda p: os.stat(p).st_mtime)
+
+
+def cmd_rollback(hook_dir=None, script_path=None):
+    """Restore ilink.py (and, with --hook-dir, the hook scripts) from
+    the newest .bak-* backup next to each file — the backups update-to
+    and the port script leave behind. All-or-nothing: every target
+    must have a backup and every backup must verify (compile check
+    for ilink.py, bash -n for hook scripts) before anything is
+    swapped. Current files are first copied to
+    '.bak-pre-rollback-<epoch>' so a rollback is itself reversible.
+    State files are never touched (same rule as update-to), and the
+    worker contract (AGENTS.md) is not rolled back — it is manual
+    anyway. After swapping, the restored script's health --offline
+    runs best-effort and its verdict is reported (HEALTH:<verdict>)
+    without changing the exit code. Prints ROLLBACK_OK:<backup> plus
+    RESTORED lines, or ROLLBACK_FAILED:<reason>. Exit 0/1."""
+    if script_path is None:
+        script_path = os.path.abspath(__file__)
+    targets = [("ilink.py", script_path)]
+    if hook_dir:
+        for name in HOOK_SCRIPT_FILES:
+            targets.append((name, os.path.join(hook_dir, name)))
+    plan = []  # (kind, target, backup, content)
+    for kind, target in targets:
+        backup = _newest_backup(target)
+        if backup is None:
+            print(f"ROLLBACK_FAILED:no-backup:{kind}")
+            return 1
+        try:
+            with open(backup) as f:
+                content = f.read()
+        except OSError as e:
+            print(f"ROLLBACK_FAILED:read:{kind}:{type(e).__name__}")
+            return 1
+        err = (_verify_python_source(content) if kind == "ilink.py"
+               else _verify_shell_source(content))
+        if err:
+            print(f"ROLLBACK_FAILED:verify:{kind}:{err[:200]}")
+            return 1
+        plan.append((kind, target, backup, content))
+    for kind, target, backup, content in plan:
+        if os.path.exists(target):
+            _copy_file(target,
+                       target + f".bak-pre-rollback-{int(time.time())}")
+        tmp = target + f".tmp-rollback-{os.getpid()}"
+        try:
+            mode = os.stat(target).st_mode & 0o777
+        except OSError:
+            mode = 0o644
+        with open(tmp, "w") as f:
+            f.write(content)
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    # Best-effort health check of the restored script: it proves the
+    # restored file not only compiles but runs. Informational only —
+    # a stale token makes health return 2, which must not fail a
+    # restore that itself succeeded, so the verdict never changes
+    # this command's exit code.
+    health_verdict = None
+    try:
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, script_path, "health", "--offline"],
+            capture_output=True, text=True, timeout=30)
+        for line in proc.stdout.splitlines():
+            if line.startswith("verdict: "):
+                health_verdict = line.split("verdict: ", 1)[1]
+                break
+    except Exception:
+        pass
+    print(f"ROLLBACK_OK:{os.path.basename(plan[0][2])}")
+    for kind, target, backup, content in plan:
+        print(f"RESTORED:{kind} from {os.path.basename(backup)}")
+    if health_verdict:
+        print(f"HEALTH:{health_verdict}")
+    return 0
+
+
+def cmd_stats():
+    """Offline snapshot from local files only (no server calls, so it
+    works while the bridge is down). Today's chatlog exchanges and
+    send-audit outcomes (local-midnight boundary), send-ledger size,
+    quote-cache size, media dir usage, session age, and queue backlog
+    (same strict queue rule as health). A missing file is a zero,
+    never a failure — stats is a diagnostic, so exit code is always
+    0."""
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    try:
+        today_start = int(time.mktime(time.strptime(today, "%Y-%m-%d")))
+    except Exception:
+        today_start = 0
+    out = ["STATS"]
+    user_n = bot_n = 0
+    try:
+        with open(os.path.join(BRIDGE, "chatlog.md")) as f:
+            for line in f:
+                if line.startswith(f"[{today}"):
+                    if "] 用户：" in line:
+                        user_n += 1
+                    elif "] 我：" in line:
+                        bot_n += 1
+    except OSError:
+        pass
+    out.append(f"chatlog today: {user_n} user / {bot_n} bot lines")
+    ok_n = fail_n = 0
+    try:
+        with open(SEND_AUDIT_FILE) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if int(entry.get("ts", 0) or 0) < today_start:
+                    continue
+                if entry.get("result") == "ok":
+                    ok_n += 1
+                else:
+                    fail_n += 1
+    except OSError:
+        pass
+    out.append(f"sends today: {ok_n} ok / {fail_n} failed")
+    try:
+        out.append(f"ledger: {len(_load_send_ledger())} entries")
+    except LedgerCorrupt:
+        out.append("ledger: CORRUPT (fail-closed, see health)")
+    except Exception:
+        out.append("ledger: unreadable")
+    try:
+        cache = _load_quote_cache()
+        out.append(f"quote cache: {len(cache['by_id'])} entries, "
+                   f"{len(cache['by_svr'])} svr mappings")
+    except Exception:
+        out.append("quote cache: unreadable")
+    try:
+        names = os.listdir(MEDIA_DIR)
+        total = 0
+        for name in names:
+            try:
+                total += os.path.getsize(os.path.join(MEDIA_DIR, name))
+            except OSError:
+                pass
+        out.append(f"media: {len(names)} file(s), "
+                   f"{total / (1024 * 1024):.1f} MB")
+    except OSError:
+        out.append("media: no dir yet")
+    try:
+        sess = load_session()
+        if sess and sess.get("login_at"):
+            out.append("session: logged in "
+                       f"({_fmt_age(int(time.time()) - int(sess['login_at']))} ago)")
+        elif sess:
+            out.append("session: present (no login_at)")
+        else:
+            out.append("session: none")
+    except Exception:
+        out.append("session: unreadable")
+    pend_n, pend_corrupt = _queue_count(
+        os.path.join(_hook_state_dir(), "ilink-pending.json"))
+    if pend_corrupt:
+        out.append("queue: pending CORRUPT (hook quarantines it)")
+    else:
+        out.append(f"queue: {pend_n} pending")
+    for line in out:
+        print(line if line == "STATS" else f"STATS {line}")
+    return 0
+
+
+def cmd_preflight():
+    """Pre-login environment check for first-time deployers: Python
+    version (>= 3.10), cryptography importable (media decryption
+    depends on it — a missing module once broke decryption silently),
+    network reachability to the iLink API host (any HTTP response at
+    all, even an error status, proves network + TLS work), and data /
+    media dir writability. No login needed, no state touched.
+    Prints PREFLIGHT lines + PREFLIGHT_OK / PREFLIGHT_FAILED.
+    Exit 0/1."""
+    results = []
+
+    def _check(name, ok, detail):
+        results.append((name, ok, detail))
+
+    if sys.version_info >= (3, 10):
+        _check("python", True, ".".join(map(str, sys.version_info[:3])))
+    else:
+        _check("python", False,
+               f"{'.'.join(map(str, sys.version_info[:3]))} < 3.10")
+    try:
+        import cryptography  # noqa: F401  (presence is the check)
+        _check("cryptography", True, "importable")
+    except ImportError:
+        _check("cryptography", False,
+               "not installed (pip install cryptography)")
+    try:
+        urllib.request.urlopen(BASE_URL, timeout=8)
+        _check("network", True, "ilinkai reachable")
+    except urllib.error.HTTPError:
+        _check("network", True, "ilinkai answered (HTTP error status)")
+    except Exception as e:
+        _check("network", False, f"unreachable: {type(e).__name__}")
+    for name, path in (("data dir", BRIDGE), ("media dir", MEDIA_DIR)):
+        if os.path.isdir(path) and os.access(path, os.W_OK):
+            _check(name, True, path)
+        else:
+            _check(name, False, f"{path} not writable")
+    for name, ok, detail in results:
+        print(f"PREFLIGHT {name}: {'PASS' if ok else 'FAIL'} ({detail})")
+    failed = [n for n, ok, _ in results if not ok]
+    if failed:
+        print(f"PREFLIGHT_FAILED: {', '.join(failed)}")
+        return 1
+    print("PREFLIGHT_OK")
+    return 0
+
+
 def _pop_key(args):
     """Extract a trailing '--key <id>' pair from an argv tail.
     Returns (key_or_None, remaining_args). A '--key' with no following
@@ -2955,6 +3310,26 @@ def main(argv):
             if a == "--to" and i + 1 < len(args):
                 to = args[i + 1]
         return cmd_smoke_test(no_send=no_send, to_user_id=to)
+    if cmd == "watchdog":
+        age = WATCHDOG_MAX_AGE_MINS
+        args = argv[2:]
+        for i, a in enumerate(args):
+            if a == "--max-age-mins" and i + 1 < len(args):
+                age = int(args[i + 1])
+        return cmd_watchdog(age)
+    if cmd == "rotate-chatlog":
+        return cmd_rotate_chatlog()
+    if cmd == "rollback":
+        hook_dir = None
+        args = argv[2:]
+        for i, a in enumerate(args):
+            if a == "--hook-dir" and i + 1 < len(args):
+                hook_dir = args[i + 1]
+        return cmd_rollback(hook_dir=hook_dir)
+    if cmd == "stats":
+        return cmd_stats()
+    if cmd == "preflight":
+        return cmd_preflight()
     if cmd == "prune-media":
         dry_run = "--dry-run" in argv
         age = MEDIA_PRUNE_MAX_AGE_DAYS

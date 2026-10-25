@@ -241,6 +241,21 @@ legs.
   a -14 inside the backoff window, meaning the token may self-heal —
   do NOT ask the user to re-scan; treat it as transient and retry
   later.
+- Hook liveness: the watch script touches `ilink-heartbeat` in the
+  hook state dir on every run, and `ilink.py watchdog` (default: 30
+  minutes stale) is the dead-man's switch for it — a cron runs it
+  every 15 minutes and reports only the first stale sighting and the
+  recovery. If the bridge is intentionally stopped, touch
+  `ilink-watchdog-off` in the same dir to silence it, and remove the
+  flag when the bridge resumes. A silent bridge with a fresh
+  heartbeat is a healthy idle bridge; a silent bridge with a stale
+  heartbeat is a dead hook — check the heartbeat before assuming
+  anything else.
+- Chatlog rotation: `ilink.py rotate-chatlog` (monthly cron) archives
+  past-month `chatlog.md` lines into `chatlog-YYYY-MM.md` files and
+  keeps current-month lines in place. Reading the last 30 lines of
+  `chatlog.md` still works after rotation; the archives exist only
+  for manual lookup of older months.
 - The bot only receives messages sent **to the bot**. It cannot read the
   user's main-account chats, contacts, or Moments; the protocol has no
   such endpoints. Do not promise otherwise.
