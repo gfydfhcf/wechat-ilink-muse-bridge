@@ -71,6 +71,10 @@ SEND_LEDGER_FILE = os.path.join(BRIDGE, "send_ledger.json")  # idempotency key -
 SEND_LEDGER_LOCK_FILE = os.path.join(BRIDGE, "send_ledger.lock")  # inter-process lock for keyed sends
 SEND_AUDIT_CAP = 1000  # audit lines kept; older lines are trimmed on write
 SEND_LEDGER_TTL = 86400  # ledger entries older than this are pruned on write
+QUOTE_CACHE_FILE = os.path.join(BRIDGE, "quote_cache.json")  # msg_id -> quoted original {text, kind, from, at, media_path?}; plus svr_id -> msg_id
+QUOTE_CACHE_LOCK_FILE = os.path.join(BRIDGE, "quote_cache.lock")  # inter-process lock for cache read-modify-write
+QUOTE_CACHE_TTL = 30 * 86400  # quoted originals older than this are pruned on write (mirrors official text retention)
+QUOTE_CACHE_CAP = 10000  # entries kept; oldest pruned first on write (mirrors official per-account cap)
 MEDIA_MAX_BYTES = 100 * 1024 * 1024  # media sends refuse above this size:
 # the protocol needs the whole file AES-encrypted and uploaded in one
 # POST, so a send reads the file fully into memory (plus ciphertext).
@@ -233,6 +237,144 @@ def save_contacts(c):
         json.dump(c, f)
     os.chmod(tmp, 0o600)
     os.replace(tmp, CONTACTS_FILE)
+
+
+# --- Quote cache ------------------------------------------------------------
+# Why this exists: when the user quotes a message, the server's ref_msg
+# carries only the quoted message's id (full quotes) or id plus a
+# partial_text fragment (selective quotes) — never the original text.
+# Restoring the original therefore needs a local id -> text cache.
+# Sources: (1) poll records every inbound owner message and every bot
+# message echoed back in getupdates; (2) send/proactive/media record
+# their server message_id on confirmed success, so a reply is quotable
+# even before the next poll echoes it back.
+#
+# Deliberately NOT fail-closed like the send ledger: a lost or corrupt
+# cache only costs a future quote resolution (the worker sees the new
+# text without its quoted original) — it can never cause a duplicate
+# send — so a corrupt cache degrades to empty with a stderr warning
+# instead of aborting poll or send.
+
+def _load_quote_cache():
+    """Return {"by_id": {...}, "by_svr": {...}}. Missing or corrupt
+    files read as empty (see above for why this degrades instead of
+    failing closed)."""
+    try:
+        with open(QUOTE_CACHE_FILE) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {"by_id": {}, "by_svr": {}}
+    except (OSError, ValueError) as e:
+        print(f"WARNING: corrupt quote cache {QUOTE_CACHE_FILE}: {e}; "
+              f"treating as empty", file=sys.stderr, flush=True)
+        return {"by_id": {}, "by_svr": {}}
+    if not isinstance(data, dict):
+        print(f"WARNING: quote cache {QUOTE_CACHE_FILE} is not an object; "
+              f"treating as empty", file=sys.stderr, flush=True)
+        return {"by_id": {}, "by_svr": {}}
+    by_id = data.get("by_id") if isinstance(data.get("by_id"), dict) else {}
+    by_svr = data.get("by_svr") if isinstance(data.get("by_svr"), dict) else {}
+    return {"by_id": by_id, "by_svr": by_svr}
+
+
+def _trim_quote_cache(cache):
+    """Drop expired entries, then oldest-first down to the cap, then
+    drop svr mappings that no longer point at a live entry."""
+    now = int(time.time())
+    by_id = cache["by_id"]
+    for mid in [m for m, e in by_id.items()
+                if now - int(e.get("at", 0) or 0) > QUOTE_CACHE_TTL]:
+        del by_id[mid]
+    if len(by_id) > QUOTE_CACHE_CAP:
+        ordered = sorted(by_id.items(), key=lambda kv: kv[1].get("at", 0))
+        for mid, _ in ordered[:len(by_id) - QUOTE_CACHE_CAP]:
+            del by_id[mid]
+    cache["by_svr"] = {s: m for s, m in cache["by_svr"].items()
+                       if m in by_id}
+
+
+def _save_quote_cache(cache):
+    _trim_quote_cache(cache)
+    tmp = QUOTE_CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache, f, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, QUOTE_CACHE_FILE)
+
+
+def _quote_cache_upsert(entries, svr_map=None):
+    """Merge entries into the quote cache. Best-effort: never raises,
+    so a cache failure cannot change a poll/send outcome. entries maps
+    str(msg_id) -> {text, kind, from, at, media_path?}; svr_map maps
+    str(svr_id) -> str(msg_id), learned when a ref carries both."""
+    if not entries and not svr_map:
+        return
+    try:
+        fd = None
+        if fcntl is not None:
+            try:
+                fd = os.open(QUOTE_CACHE_LOCK_FILE,
+                             os.O_CREAT | os.O_RDWR, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except Exception:
+                # Proceed unlocked: a lost cache entry is harmless, and
+                # blocking poll/send on a lock would be worse.
+                fd = None
+        try:
+            cache = _load_quote_cache()
+            cache["by_id"].update(entries)
+            if svr_map:
+                cache["by_svr"].update(svr_map)
+            _save_quote_cache(cache)
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+    except Exception as e:
+        print(f"WARNING: quote cache upsert failed: {e}",
+              file=sys.stderr, flush=True)
+
+
+def _quote_media_descriptor(t, item):
+    if t == 2:
+        return "[图片]"
+    if t == 4:
+        name = (item.get("file_item") or {}).get("file_name", "")
+        return f"[文件：{name}]" if name else "[文件]"
+    if t == 5:
+        return "[视频]"
+    return ""
+
+
+def _quote_resolve(loaded, pending_entries, pending_svr, ref_msg):
+    """Resolve a raw ref_msg against the loaded cache plus entries cached
+    earlier in this same poll batch. Returns (entry_or_None,
+    fragment_or_None). Full quotes carry only the quoted msg_id;
+    selective quotes also carry partial_text (start/end characters +
+    md5). The captured start/end indices were both 0 and ambiguous, so
+    matching uses the characters, not the indices — and the fragment is
+    surfaced even on a cache miss, so a selective quote is at least
+    partly readable without any cache hit."""
+    if not isinstance(ref_msg, dict):
+        return None, None
+    ref_item = ref_msg.get("message_item") or {}
+    target = ref_item.get("msg_id") or ref_msg.get("msg_id")
+    if not target and ref_msg.get("svr_id"):
+        svr = str(ref_msg["svr_id"])
+        target = (pending_svr or {}).get(svr) or \
+            (loaded.get("by_svr") or {}).get(svr)
+    entry = None
+    if target:
+        entry = (pending_entries or {}).get(str(target)) or \
+            (loaded.get("by_id") or {}).get(str(target))
+    fragment = None
+    partial = ref_msg.get("partial_text") or {}
+    start, end = partial.get("start"), partial.get("end")
+    if start or end:
+        fragment = {"start": start, "end": end}
+    return entry, fragment
 
 
 # --- Inbound dedupe ---------------------------------------------------------
@@ -719,7 +861,32 @@ def cmd_poll():
     filtered_senders = []
     msgs = []
     contacts = load_contacts()
+    quote_cache = _load_quote_cache()
+    pending_entries = {}
+    pending_svr = {}
     for m in fresh:
+        if m.get("message_type") == 2:
+            # The bot's own words echoed back: cache only, never queue.
+            # No media download here: a descriptor is enough for a
+            # future quote lookup, and the send path already records
+            # the full text of bot messages it sent.
+            parts = []
+            kinds = []
+            for item in m.get("item_list") or []:
+                t = item.get("type") or 0
+                if t == 1:
+                    tx = (item.get("text_item") or {}).get("text", "")
+                    if tx:
+                        parts.append(tx)
+                        kinds.append("text")
+                elif t in (2, 4, 5):
+                    parts.append(_quote_media_descriptor(t, item))
+                    kinds.append(ITEM_TYPE_NAMES.get(t, "text"))
+            if parts and m.get("message_id"):
+                pending_entries[str(m["message_id"])] = {
+                    "text": "\n".join(parts), "kind": kinds[0],
+                    "from": "bot", "at": int(time.time())}
+            continue
         if m.get("message_type") != 1:  # 只要用户发来的消息
             continue
         from_id = m.get("from_user_id")
@@ -738,6 +905,9 @@ def cmd_poll():
         ctx = m.get("context_token")
         if from_id and ctx:
             contacts[from_id] = {"context_token": ctx, "updated_at": int(time.time())}
+        cache_parts = []
+        cache_kinds = []
+        cache_media_path = None
         for item in m.get("item_list") or []:
             t = item.get("type") or 0
             kind = ITEM_TYPE_NAMES.get(t, f"unknown_{t}")
@@ -745,29 +915,71 @@ def cmd_poll():
                      "message_id": m.get("message_id")}
             if t == 1:  # TEXT
                 entry["text"] = (item.get("text_item") or {}).get("text", "")
+                if entry["text"]:
+                    cache_parts.append(entry["text"])
+                    cache_kinds.append("text")
             elif t == 3:  # VOICE: 可能带语音转写文本
                 entry["text"] = (item.get("voice_item") or {}).get("text", "")
                 entry["voice_duration_ms"] = (item.get("voice_item") or {}).get("playtime", 0)
+                if entry["text"]:
+                    cache_parts.append(entry["text"])
+                    cache_kinds.append("voice")
                 try:
                     p = download_media_item(item, t)
                     if p:
                         entry["media_path"] = p
+                        cache_media_path = p
                 except Exception as e:
                     entry["media_error"] = str(e)[:100]
             elif t in (2, 4, 5):  # IMAGE / FILE / VIDEO
                 if t == 4:
                     entry["file_name"] = (item.get("file_item") or {}).get("file_name", "")
+                cache_parts.append(_quote_media_descriptor(t, item))
+                cache_kinds.append(ITEM_TYPE_NAMES.get(t, "text"))
                 try:
                     p = download_media_item(item, t)
                     if p:
                         entry["media_path"] = p
+                        cache_media_path = p
                     else:
                         entry["media_error"] = "download failed"
                 except Exception as e:
                     entry["media_error"] = str(e)[:100]
             else:
                 continue
+            ref_msg = item.get("ref_msg")
+            if isinstance(ref_msg, dict) and ref_msg:
+                ref_item = ref_msg.get("message_item") or {}
+                if ref_item.get("msg_id"):
+                    entry["ref_msg_id"] = str(ref_item["msg_id"])
+                if ref_msg.get("svr_id"):
+                    entry["ref_svr_id"] = str(ref_msg["svr_id"])
+                    if ref_item.get("msg_id"):
+                        # Learn the svr -> msg mapping for later quotes
+                        # that carry only svr_id.
+                        pending_svr[str(ref_msg["svr_id"])] = str(ref_item["msg_id"])
+                if ref_msg.get("title"):
+                    entry["quoted_title"] = ref_msg["title"]
+                resolved, fragment = _quote_resolve(
+                    quote_cache, pending_entries, pending_svr, ref_msg)
+                if resolved:
+                    if resolved.get("text"):
+                        entry["quoted_text"] = resolved["text"]
+                    entry["quoted_kind"] = resolved.get("kind", "text")
+                    if resolved.get("media_path"):
+                        entry["quoted_media_path"] = resolved["media_path"]
+                if fragment:
+                    entry["quoted_fragment"] = fragment
             msgs.append(entry)
+        if (cache_parts or cache_media_path) and m.get("message_id"):
+            cache_entry = {"text": "\n".join(cache_parts),
+                           "kind": cache_kinds[0] if cache_kinds else "text",
+                           "from": "user", "at": int(time.time())}
+            if cache_media_path:
+                cache_entry["media_path"] = cache_media_path
+            pending_entries[str(m["message_id"])] = cache_entry
+    if pending_entries or pending_svr:
+        _quote_cache_upsert(pending_entries, pending_svr)
     if contacts:
         save_contacts(contacts)
     # Two-phase commit: do NOT advance the cursor or record seen ids
@@ -1212,6 +1424,12 @@ def cmd_proactive(to_user_id, text, key=None):
                         error=type(e).__name__)
             print(f"LEDGER_WRITE_FAILED:{e}")
             return 1
+    if data.get("message_id"):
+        # Confirmed success: the push is quotable from now on, even
+        # before the next poll echoes it back.
+        _quote_cache_upsert({str(data["message_id"]): {
+            "text": text, "kind": "text", "from": "bot",
+            "at": int(time.time())}})
     print("PROACTIVE_OK")
     return 0
 
@@ -1299,6 +1517,12 @@ def cmd_send(to_user_id, context_token, text, key=None):
                             error=type(e).__name__, attempt=attempt)
                 print(f"LEDGER_WRITE_FAILED:{e}")
                 return 1
+        if data.get("message_id"):
+            # Confirmed success: the reply is quotable from now on, even
+            # before the next poll echoes it back.
+            _quote_cache_upsert({str(data["message_id"]): {
+                "text": text, "kind": "text", "from": "bot",
+                "at": int(time.time())}})
         print("SEND_OK")
         return 0
 
@@ -1546,6 +1770,13 @@ def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, k
                         error=type(e).__name__)
             print(f"LEDGER_WRITE_FAILED:{e}")
             return 1
+    if data_resp.get("message_id"):
+        # Confirmed success: the media message is quotable from now on.
+        _quote_cache_upsert({str(data_resp["message_id"]): {
+            "text": os.path.basename(path),
+            "kind": ITEM_TYPE_NAMES.get(media_type, "file"),
+            "from": "bot", "at": int(time.time()),
+            "media_path": path}})
     print("SEND_OK")
     return 0
 
@@ -1646,6 +1877,13 @@ def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
                         error=type(e).__name__)
             print(f"LEDGER_WRITE_FAILED:{e}")
             return 1
+    if data_resp.get("message_id"):
+        # Confirmed success: the media message is quotable from now on.
+        _quote_cache_upsert({str(data_resp["message_id"]): {
+            "text": os.path.basename(path),
+            "kind": ITEM_TYPE_NAMES.get(media_type, "file"),
+            "from": "bot", "at": int(time.time()),
+            "media_path": path}})
     print("PROACTIVE_OK")
     return 0
 
