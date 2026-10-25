@@ -323,7 +323,7 @@ def cmd_prune_media(max_age_days=MEDIA_PRUNE_MAX_AGE_DAYS,
 # release — a forgotten bump makes every deployment report itself
 # outdated forever, since the check compares this constant with the
 # latest release tag.
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 VERSION_CHECK_URL = ("https://api.github.com/repos/gfydfhcf/"
                      "wechat-ilink-muse-bridge/releases/latest")
 VERSION_NOTIFY_FILE = os.path.join(BRIDGE, "version_notify.json")
