@@ -34,7 +34,7 @@
 在扫码那一步拿出微信扫一下。
 
 登录后它还会请你在 **10 分钟内给机器人发第一条消息**完成主人绑定：
-第一个发信的账号即成为 Owner，并会收到三条欢迎消息；超时没发，
+第一个发信的账号即成为 Owner，并会收到四条欢迎消息（含一条订阅更新提醒的提问）；超时没发，
 它会再次提醒你并重开绑定窗口。
 
 部署完成后还有一个日常流程值得知道：**添加新发信人**。名单外的人
@@ -78,6 +78,20 @@ Muse 的主聊天里说一句"把待批名单里的加进白名单"，它会把�
 - **health 自检** — `ilink.py health` 一条命令看全状态：登录时长、
   token 在线探活、队列积压、最近轮询错误，退出码 0/1/2 可直接接监控
 - **token 过期只吵一次** — 过期后落一个标记文件，只通知用户重扫一次
+- **引用消息还原** — 微信里引用一条消息再提问时，机器人能看到被引的原文
+  （文字、文件都行）：poll 保留服务端下发的引用关系，本地缓存 id→原文
+  30 天/1 万条，机器人自发消息也进缓存；缓存建立之前的旧消息无法事后
+  补（服务端没有按 id 取原文的接口）
+- **订阅更新提醒 + 一句话安装** — `version-check` 查上游最新 Release；
+  主人回“订阅”即开通，通知只发已订阅主人、每版本一次；回“安装更新”
+  即在后台装新版（先全部校验、再全部替换，失败回滚，状态文件不碰）
+- **存活看门狗** — hook 每轮 touch 心跳，`ilink.py watchdog` 判 30 分钟
+  过期，15 分钟 cron 首报 + 恢复报、重复过期静默；桥有意停用时 touch
+  维护标记即可静音
+- **运维命令** — `rollback`（从最新 .bak-* 备份恢复）、`stats`（纯本地
+  快照，不调服务端）、`preflight`（登录前环境预检）、`smoke-test`
+  （端到端冒烟自检）、`prune-media`（媒体保留清理）、`rotate-chatlog`
+  （往月对话记录归档），详见下方速查表
 
 ## 出站消息的 Markdown 渲染
 
@@ -105,7 +119,7 @@ Claude Code 类（[crazynomad/weixin-claude-bot](https://github.com/crazynomad/w
 这个仓库接的是 **Muse 个人助理本体**——一个有长期记忆、会管目标和
 提醒、能主动汇报的助理，而不是一个编程 CLI 或裸 LLM API。所以它的
 重点不在“库设计”，而在**一个真实助理跑在微信上会踩的坑**：连发合并、
-防重复发送、过期单次提醒、消息队列不丢不重。欢迎对着抄。
+防重复发送、过期单次提醒、消息队列至少一次、可能重复、绝不静默丢失。欢迎对着抄。
 
 ## 架构
 
@@ -187,6 +201,17 @@ python3 ilink.py send-video <user_id> <ctx> <视频路径>   # 回复一个视�
 python3 ilink.py proactive-image <user_id> <图片路径>    # 主动推送图片
 python3 ilink.py proactive-file <user_id> <文件路径>     # 主动推送文件
 python3 ilink.py proactive-video <user_id> <视频路径>    # 主动推送视频
+python3 ilink.py version-check [--notify]              # 查上游最新 Release（--notify 只发已订阅主人）
+python3 ilink.py subscribe <owner_id>                  # 开通更新提醒
+python3 ilink.py unsubscribe <owner_id>                # 取消更新提醒
+python3 ilink.py update-to <tag> [--hook-dir <dir>]    # 装指定 Release（两阶段、失败回滚）
+python3 ilink.py rollback [--hook-dir <dir>]           # 从最新 .bak-* 备份恢复
+python3 ilink.py watchdog [--max-age-mins N]           # hook 心跳看门狗（默认 30 分钟）
+python3 ilink.py stats                                 # 本地快照（不调服务端）
+python3 ilink.py preflight                             # 登录前环境预检
+python3 ilink.py rotate-chatlog                        # 往月对话记录归档
+python3 ilink.py prune-media [--dry-run]               # 媒体保留清理（默认 30 天 + 500MB）
+python3 ilink.py smoke-test [--no-send]                # 端到端冒烟自检
 ```
 
 数据目录默认 `./data/`，可用环境变量 `ILINK_DATA_DIR` 覆盖。

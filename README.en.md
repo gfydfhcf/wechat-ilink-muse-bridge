@@ -38,7 +38,8 @@ repo root — you only need to pick up WeChat once, at the QR-scan step.
 
 After login it will ask you to **send the bot a first message within 10
 minutes** to bind the owner: the first sender becomes the Owner and
-receives a three-part welcome; if nobody messages in time, it reminds
+receives a four-part welcome (the fourth asks about subscribing to
+release reminders); if nobody messages in time, it reminds
 you again and reopens the binding window.
 
 One day-to-day flow worth knowing once deployed: **approving a new
@@ -99,6 +100,28 @@ keeps a stranger from talking their way onto the allowlist.
   exit codes 0/1/2 for monitoring
 - **Token expiry nags once** — on expiry a marker file is written and the
   user is asked to re-scan exactly once
+- **Quoted-message restoration** — when you quote a message and ask about
+  it in WeChat, the bot sees the quoted original (text or file): poll
+  keeps the server's quote reference and a local id-to-original cache
+  (30 days / 10k entries, including the bot's own messages). Messages
+  from before the cache existed can't be recovered afterwards — the
+  server offers no fetch-by-id endpoint
+- **Subscription update reminders + one-sentence install** —
+  `version-check` queries the upstream latest Release; owners opt in by
+  replying "subscribe", notifications go only to subscribed owners once
+  per version, and replying "install update" installs the new release
+  in the background (verify everything first, then swap, roll back on
+  failure, state files untouched)
+- **Liveness watchdog** — the hook touches a heartbeat every run;
+  `ilink.py watchdog` flags staleness after 30 minutes, a 15-minute
+  cron reports the first sighting and the recovery, repeat staleness
+  stays silent; a maintenance flag silences it while the bridge is
+  intentionally stopped
+- **Ops commands** — `rollback` (restore from the newest .bak-*
+  backup), `stats` (offline snapshot, no server calls), `preflight`
+  (pre-login environment check), `smoke-test` (end-to-end self-check),
+  `prune-media` (media retention cleanup), `rotate-chatlog` (monthly
+  chatlog archiving); see the cheat sheet below
 
 ## Markdown rendering in outbound messages
 
@@ -134,8 +157,8 @@ This repo connects **Muse the personal assistant itself** — an assistant with
 long-term memory, goals and reminders that reports back proactively — not a
 coding CLI or a bare LLM API. So the focus is not library design, but **the
 pitfalls a real assistant hits when it lives on WeChat**: burst merging,
-duplicate-send prevention, nag-once token expiry, and a queue that never
-loses or double-delivers a message. Steal away.
+duplicate-send prevention, nag-once token expiry, and an at-least-once
+queue that may redeliver but never silently loses a message. Steal away.
 
 ## Architecture
 
@@ -229,6 +252,17 @@ python3 ilink.py send-video <user_id> <ctx> <video>     # reply with a video
 python3 ilink.py proactive-image <user_id> <image>      # proactively push an image
 python3 ilink.py proactive-file <user_id> <file>        # proactively push a file
 python3 ilink.py proactive-video <user_id> <video>      # proactively push a video
+python3 ilink.py version-check [--notify]              # check upstream latest Release (--notify: subscribed owners only)
+python3 ilink.py subscribe <owner_id>                  # opt in to update reminders
+python3 ilink.py unsubscribe <owner_id>                # opt out of update reminders
+python3 ilink.py update-to <tag> [--hook-dir <dir>]    # install a Release tag (two-phase, rolls back on failure)
+python3 ilink.py rollback [--hook-dir <dir>]           # restore from the newest .bak-* backup
+python3 ilink.py watchdog [--max-age-mins N]           # hook heartbeat watchdog (default 30 minutes)
+python3 ilink.py stats                                 # offline snapshot (no server calls)
+python3 ilink.py preflight                             # pre-login environment check
+python3 ilink.py rotate-chatlog                        # archive past-month chatlog lines
+python3 ilink.py prune-media [--dry-run]               # media retention cleanup (default 30 days + 500MB)
+python3 ilink.py smoke-test [--no-send]                # end-to-end self-check
 ```
 
 The data directory defaults to `./data/` and can be overridden with the
