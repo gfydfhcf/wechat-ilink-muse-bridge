@@ -217,6 +217,13 @@ last poll error, with a 0/1/2 exit code:
 python3 ilink.py health            # add --offline to skip the live probe
 ```
 
+For an end-to-end check (not just local state), run `ilink.py smoke-test`:
+it probes the token live, checks receive/ledger readiness, and — unless
+`--no-send` — sends the owner a real test text plus a 1x1 test image
+through the production send paths. Exit 0 means every check passed
+(SKIP does not fail); anything else prints SMOKE_FAILED with the failed
+legs.
+
 ## 4. Ongoing behavior
 
 - Approving new senders: ids of turned-away senders collect in

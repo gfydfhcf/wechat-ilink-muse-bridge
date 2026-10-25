@@ -18,6 +18,7 @@ Usage:
   ilink.py proactive-image <to> <path>    # proactive image via cached ctx
   ilink.py proactive-file <to> <path>     # proactive file via cached ctx
   ilink.py health [--offline]  # self-check: auth, queue, last poll (exit 0 ok / 1 warn / 2 bad)
+  ilink.py smoke-test [--no-send] [--to <owner>]  # end-to-end chain check: login probe, receive readiness, real text+image to owner, ledger (exit 0 ok / 1 fail)
   ilink.py proactive-video <to> <path>    # proactive video via cached ctx
   ilink.py proactive-voice <to> <path> <playtime_ms>   # proactive voice (dropped by channel, see send-voice)
 
@@ -39,11 +40,13 @@ import base64
 import contextlib
 import functools
 import inspect
+import io
 import json
 import os
 import random
 import re
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -2747,6 +2750,161 @@ def cmd_health(offline=False):
     return 0
 
 
+# 1x1 transparent PNG (base64) for the smoke-test media leg: a real
+# image upload through the encrypted CDN path, nearly invisible to the
+# owner, and self-describing via the text leg sent just before it.
+_SMOKE_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+_SMOKE_TEXT = ("🔥 冒烟测试：这条是 ilink.py smoke-test 发出的测试消息，"
+               "下一条是测试图片，收到请忽略。")
+
+
+def cmd_smoke_test(no_send=False, to_user_id=None):
+    """End-to-end chain check, beyond health's local-state snapshot:
+    login probe, local receive readiness, a real proactive text +
+    image to the owner (unless --no-send), and send-ledger
+    readability. Prints one SMOKE line per check and SMOKE_OK /
+    SMOKE_FAILED; exit 0 only when nothing FAILED (SKIP does not
+    fail). The send legs deliberately reuse cmd_proactive /
+    cmd_proactive_media — the exact production paths, including the
+    tokenless retry — so a PASS means the real chain works, not a
+    rehearsal of it. No --key: every run must really send, or a
+    repeat run would print SEND_ALREADY_SENT and prove nothing. The
+    test image lives in a temp dir (not MEDIA_DIR) so it never enters
+    media retention; the quote-cache entry it leaves behind points at
+    a deleted path, same as any pruned media."""
+    results = []  # (name, status, detail)
+
+    def _check(name, status, detail=""):
+        results.append((name, status, detail))
+
+    # -- target: explicit --to wins, else the primary owner.
+    target = to_user_id
+    if not target:
+        try:
+            with open(os.path.join(BRIDGE, "owner.json")) as f:
+                target = json.load(f).get("owner_id")
+        except Exception:
+            target = None
+        if not target:
+            owners = load_owner_ids()
+            target = sorted(owners)[0] if owners else None
+
+    # -- login: session token + the same live getconfig probe health
+    # uses (no side effects, does not touch the message cursor).
+    # Deliberately NOT getupdates: that is a ~35s long-poll hold, and
+    # a fetch that is never committed would just be redelivered.
+    # A diagnostic reports only: on -14 it must NOT call
+    # _report_token_status, which would flip the token-stale state
+    # machine as a side effect.
+    s = load_session()
+    token = s.get("bot_token")
+    if not token:
+        _check("login", "FAIL", "not logged in: no bot_token in session")
+    else:
+        ctx = (load_contacts().get(target) or {}).get("context_token") if target else None
+        if not ctx:
+            _check("login", "SKIP", "no cached owner context_token for probe")
+        else:
+            try:
+                data = api("POST", "ilink/bot/getconfig",
+                           {"ilink_user_id": target, "context_token": ctx,
+                            "base_info": {"channel_version": "1.0.2"}},
+                           token=token, timeout=12)
+            except Exception as e:
+                _check("login", "FAIL", f"probe failed: {type(e).__name__}")
+            else:
+                if data.get("typing_ticket"):
+                    _check("login", "PASS", "getconfig OK")
+                elif data.get("code") == -14:
+                    _check("login", "FAIL", "token expired (getconfig code -14)")
+                else:
+                    _check("login", "FAIL", f"probe unclear: {str(data)[:80]}")
+
+    # -- receive: local readiness of the inbound path (dirs writable,
+    # session parses). The live poll loop is exercised by the hook
+    # every few seconds; poll.log carries its errors.
+    recv_problems = []
+    if not (os.path.isdir(BRIDGE) and os.access(BRIDGE, os.W_OK)):
+        recv_problems.append("data dir not writable")
+    if not (os.path.isdir(MEDIA_DIR) and os.access(MEDIA_DIR, os.W_OK)):
+        recv_problems.append("media dir not writable")
+    try:
+        with open(SESSION_FILE) as f:
+            sdata = json.load(f)
+        if not isinstance(sdata, dict):
+            recv_problems.append("session is not an object")
+    except FileNotFoundError:
+        recv_problems.append("no session file")
+    except Exception as e:
+        recv_problems.append(f"session unreadable: {type(e).__name__}")
+    if recv_problems:
+        _check("receive", "FAIL", "; ".join(recv_problems))
+    else:
+        _check("receive", "PASS", "dirs writable, session parses")
+
+    # -- send / media: real proactive legs, their stdout swallowed so
+    # the report stays one line per check; return codes decide, with
+    # the swallowed last line as the failure detail when present.
+    def _run_leg(func, *args):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = func(*args)
+        out = buf.getvalue().strip().splitlines()
+        return code, (out[-1][:80] if out else f"exited {code}")
+
+    if no_send:
+        _check("send", "SKIP", "--no-send")
+        _check("media", "SKIP", "--no-send")
+    elif not target:
+        _check("send", "FAIL", "no owner configured (bind first)")
+        _check("media", "SKIP", "no target to send to")
+    else:
+        code, detail = _run_leg(cmd_proactive, target, _SMOKE_TEXT)
+        if code == 0:
+            _check("send", "PASS", f"PROACTIVE_OK to {target}")
+        else:
+            _check("send", "FAIL", detail)
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".png", prefix="ilink-smoke-")
+            with os.fdopen(fd, "wb") as f:
+                f.write(base64.b64decode(_SMOKE_PNG_B64))
+            code, detail = _run_leg(cmd_proactive_media, target, tmp_path, 2)
+            if code == 0:
+                _check("media", "PASS", "proactive image OK")
+            else:
+                _check("media", "FAIL", detail)
+        except Exception as e:
+            _check("media", "FAIL", f"media leg error: {type(e).__name__}")
+        finally:
+            if tmp_path:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+
+    # -- ledger: a corrupt ledger fail-closes every keyed send, so it
+    # is a chain failure here, not health's warning.
+    try:
+        book = _load_send_ledger()
+    except LedgerCorrupt as e:
+        _check("ledger", "FAIL", f"ledger corrupt: {e}")
+    except Exception as e:
+        _check("ledger", "FAIL", f"ledger unreadable: {type(e).__name__}")
+    else:
+        _check("ledger", "PASS", f"{len(book)} entries")
+
+    for name, status, detail in results:
+        print(f"SMOKE {name}: {status}" + (f" ({detail})" if detail else ""))
+    failed = [n for n, st, _ in results if st == "FAIL"]
+    if failed:
+        print(f"SMOKE_FAILED: {', '.join(failed)}")
+        return 1
+    print("SMOKE_OK")
+    return 0
+
+
 def _pop_key(args):
     """Extract a trailing '--key <id>' pair from an argv tail.
     Returns (key_or_None, remaining_args). A '--key' with no following
@@ -2789,6 +2947,14 @@ def main(argv):
         return cmd_commit()
     if cmd == "health":
         return cmd_health(offline="--offline" in argv)
+    if cmd == "smoke-test":
+        no_send = "--no-send" in argv
+        to = None
+        args = [a for a in argv[2:] if a != "--no-send"]
+        for i, a in enumerate(args):
+            if a == "--to" and i + 1 < len(args):
+                to = args[i + 1]
+        return cmd_smoke_test(no_send=no_send, to_user_id=to)
     if cmd == "prune-media":
         dry_run = "--dry-run" in argv
         age = MEDIA_PRUNE_MAX_AGE_DAYS
