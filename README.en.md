@@ -290,6 +290,13 @@ The data directory defaults to `./data/` and can be overridden with the
   directory for reference, and the post-update message says so
   explicitly. Only release tags are installed, never the latest code on
   main, and never from an arbitrary URL.
+- **In-chat slash commands: not implemented**: unlike Telegram, WeChat
+  shows no command menu when you type `/` — a slash command is just
+  plain text with no discovery entry point. The bot is an LLM, so
+  natural language already covers the same intents ("how are you
+  doing?", "forget what I said above"); actions that must execute
+  exactly (subscribe/unsubscribe/install update) use exact keyword
+  matching instead of slashes.
 
 ## Security notes
 
