@@ -356,27 +356,89 @@ def _fetch_latest_release_tag():
         return None
 
 
-def _primary_owner_id():
-    """First owner_id in owner.json (list order = primary account
-    first), falling back to the legacy single owner_id."""
+def _load_version_notify():
+    """Load version_notify.json: {"subscribed": [owner_ids],
+    "notified": {owner_id: tag}}. Missing or corrupt reads as empty.
+    NOTE: the pre-subscription shape {"last_notified_tag": ...} is
+    deliberately ignored — subscriptions are opt-in from scratch, so
+    every owner gets at most one notice per tag after subscribing."""
     try:
-        with open(os.path.join(BRIDGE, "owner.json")) as f:
+        with open(VERSION_NOTIFY_FILE) as f:
             data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return None
-    ids = data.get("owner_ids") or []
-    if ids:
-        return ids[0]
-    return data.get("owner_id")
+        return {}
+
+
+def _save_version_notify(state):
+    try:
+        tmp = VERSION_NOTIFY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, VERSION_NOTIFY_FILE)
+    except Exception:
+        pass
+
+
+SUBSCRIBE_ASK_FILE = os.path.join(BRIDGE, "subscribe_ask.json")
+SUBSCRIBE_ASK_TTL = 86400
+
+
+def _write_subscribe_ask(owner_id):
+    """Open the subscribe-question window after the welcome is
+    delivered. Best-effort: a failed write just means the worker has
+    no window to interpret a bare 'yes' against."""
+    try:
+        _save_json_atomic(SUBSCRIBE_ASK_FILE,
+                          {"owner_id": owner_id,
+                           "asked_at": int(time.time())})
+    except Exception:
+        pass
+
+
+def _clear_subscribe_ask():
+    try:
+        os.remove(SUBSCRIBE_ASK_FILE)
+    except OSError:
+        pass
+
+
+def cmd_subscribe(owner_id):
+    """Opt an owner into release reminders. Idempotent, and clears any
+    pending subscribe question (the decision has been made)."""
+    state = _load_version_notify()
+    subscribed = state.get("subscribed") or []
+    if owner_id not in subscribed:
+        subscribed.append(owner_id)
+    state["subscribed"] = subscribed
+    _save_version_notify(state)
+    _clear_subscribe_ask()
+    print(f"SUBSCRIBED:{owner_id}")
+    return 0
+
+
+def cmd_unsubscribe(owner_id):
+    """Opt an owner out of release reminders. Idempotent, and clears
+    any pending subscribe question."""
+    state = _load_version_notify()
+    state["subscribed"] = [o for o in (state.get("subscribed") or [])
+                           if o != owner_id]
+    _save_version_notify(state)
+    _clear_subscribe_ask()
+    print(f"UNSUBSCRIBED:{owner_id}")
+    return 0
 
 
 def cmd_version_check(notify=False):
     """Compare local VERSION with the upstream latest release tag.
     Prints UP_TO_DATE, UPDATE_AVAILABLE:<tag>, or
-    VERSION_CHECK_FAILED. With --notify and an update available that
-    was not already notified for this tag, sends one proactive
-    notification to the owner and records the tag, so each release
-    notifies at most once."""
+    VERSION_CHECK_FAILED. With --notify and an update available, sends
+    one proactive notification to each SUBSCRIBED owner who has a
+    cached context_token and was not already notified for this tag.
+    Unsubscribed owners are never notified. A failed send is not
+    recorded, so the next check retries it (an offline bot's notice is
+    deferred, not lost)."""
     tag = _fetch_latest_release_tag()
     if not tag:
         print("VERSION_CHECK_FAILED")
@@ -387,42 +449,38 @@ def cmd_version_check(notify=False):
     print(f"UPDATE_AVAILABLE:{tag}")
     if not notify:
         return 0
-    notified = {}
-    try:
-        with open(VERSION_NOTIFY_FILE) as f:
-            notified = json.load(f)
-    except Exception:
-        notified = {}
-    if notified.get("last_notified_tag") == tag:
-        return 0
+    state = _load_version_notify()
+    subscribed = state.get("subscribed") or []
+    notified = state.get("notified") or {}
+    if not subscribed:
+        print("NO_SUBSCRIBERS")
+        return 1
+    pending = [o for o in subscribed if notified.get(o) != tag]
+    if not pending:
+        return 0  # everyone already notified for this tag: quiet success
     contacts = load_contacts()
-    candidates = []
-    primary = _primary_owner_id()
-    if primary:
-        candidates.append(primary)
-    candidates.extend(sorted(load_owner_ids()))
-    target = None
-    for owner in candidates:
-        if (contacts.get(owner) or {}).get("context_token"):
-            target = owner
-            break
-    if not target:
+    reachable = [o for o in pending
+                 if (contacts.get(o) or {}).get("context_token")]
+    if not reachable:
         print("NO_CONTEXT_TOKEN")
         return 1
-    code = cmd_proactive(
-        target,
-        f"微信桥有新版了：{tag}（当前 {VERSION}），去仓库看看更新内容再升级。")
-    if code != 0:
-        return code
-    try:
-        tmp = VERSION_NOTIFY_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"last_notified_tag": tag,
-                       "checked_at": int(time.time())}, f)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, VERSION_NOTIFY_FILE)
-    except Exception:
-        pass
+    sent_any = False
+    last_code = 0
+    for owner in reachable:
+        code = cmd_proactive(
+            owner,
+            f"微信桥有新版了：{tag}（当前 {VERSION}），去仓库看看更新内容再升级。")
+        if code == 0:
+            notified[owner] = tag
+            sent_any = True
+        else:
+            last_code = code
+    state["subscribed"] = subscribed
+    state["notified"] = notified
+    state["checked_at"] = int(time.time())
+    _save_version_notify(state)
+    if not sent_any:
+        return last_code or 1
     return 0
 
 
@@ -702,7 +760,7 @@ def note_unknown_sender(from_id):
 # poll stays deny-by-default forever. After QR login the deployer runs
 # `ilink.py bind`, which opens ONE bounded window (default 600s). The first
 # account to message the bot inside that window becomes the owner and gets
-# the three-part welcome below. If the window lapses, bind exits with
+# the four-part welcome below. If the window lapses, bind exits with
 # BIND_TIMEOUT (exit 3) so the deploying agent can remind the human and run
 # bind again — an unattended, indefinitely open "first come wins" mode
 # would let a stranger seize a bridge whose owner file was lost.
@@ -711,6 +769,7 @@ WELCOME_MESSAGES = [
     "欢迎使用 WeChat iLink Muse Bridge！",
     "绑定成功，当前微信账号已设为 Owner。今后只有 Owner 以及你手动批准的账号可以与我聊天。",
     "现在可以直接给我发送消息了。",
+    "顺便问一句：要不要订阅本项目的更新提醒？有新版时我会在微信上告诉你。回复「订阅」就开通，随时回「取消订阅」就能关。",
 ]
 
 
@@ -848,6 +907,12 @@ def _deliver_pending_welcome(token):
         s["cursor"] = commit["cursor"]
         save_session(s)
     mark_seen(commit.get("ids") or [])
+    # The welcome is fully delivered: open the 24h subscribe-question
+    # window. The worker interprets an affirmative owner reply inside
+    # the window as opting in (see the worker contract in AGENTS.md);
+    # the marker is inert after expiry and is cleared by any
+    # subscribe/unsubscribe decision.
+    _write_subscribe_ask(owner_id)
     clear_bind_state()
     print(f"BIND_OK:{owner_id}")
     return 0
@@ -2465,6 +2530,14 @@ def main(argv):
         return cmd_prune_media(age, total_mb * 1024 * 1024, dry_run)
     if cmd == "version-check":
         return cmd_version_check(notify="--notify" in argv)
+    if cmd == "subscribe":
+        if not _need(argv, 3, "ilink.py subscribe <owner_id>"):
+            return 2
+        return cmd_subscribe(argv[2])
+    if cmd == "unsubscribe":
+        if not _need(argv, 3, "ilink.py unsubscribe <owner_id>"):
+            return 2
+        return cmd_unsubscribe(argv[2])
     if cmd == "send":
         if not _need(argv, 5, "ilink.py send <to> <ctx> <text> [--key <id>]"):
             return 2

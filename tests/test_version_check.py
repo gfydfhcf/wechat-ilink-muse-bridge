@@ -55,7 +55,8 @@ def fake_urlopen(req, timeout=None):
 def fake_api(*args, **kwargs):
     path = args[1] if len(args) > 1 else ""
     if "sendmessage" in path:
-        SENDS.append(path)
+        body = args[2] if len(args) > 2 else {}
+        SENDS.append((body.get("msg") or {}).get("to_user_id"))
         return {"code": 0, "message_id": 999}
     raise AssertionError(f"unexpected api call: {path}")
 
@@ -116,18 +117,47 @@ class VersionCheckTest(unittest.TestCase):
         self.assertIn("UPDATE_AVAILABLE:v1.3.0", out)
         self.assertEqual(SENDS, [])
 
+    def _set_subscribed(self, owners):
+        with open(ilink.VERSION_NOTIFY_FILE, "w") as f:
+            json.dump({"subscribed": owners, "notified": {}}, f)
+
     def test_notify_once_per_tag(self):
         RELEASE["tag"] = "v1.3.0"
+        self._set_subscribed(["owner-1"])
         code, out = run_check(notify=True)
         self.assertEqual(code, 0)
         self.assertIn("UPDATE_AVAILABLE:v1.3.0", out)
-        self.assertEqual(len(SENDS), 1)
+        self.assertEqual(SENDS, ["owner-1"])
         with open(ilink.VERSION_NOTIFY_FILE) as f:
-            self.assertEqual(json.load(f)["last_notified_tag"], "v1.3.0")
+            state = json.load(f)
+        self.assertEqual(state["notified"], {"owner-1": "v1.3.0"})
         # Second run for the same tag sends nothing.
         code, _ = run_check(notify=True)
         self.assertEqual(code, 0)
-        self.assertEqual(len(SENDS), 1)
+        self.assertEqual(SENDS, ["owner-1"])
+
+    def test_notify_unsubscribed_sends_nothing(self):
+        RELEASE["tag"] = "v1.3.0"
+        code, out = run_check(notify=True)
+        self.assertEqual(code, 1)
+        self.assertIn("NO_SUBSCRIBERS", out)
+        self.assertEqual(SENDS, [])
+
+    def test_notify_per_owner_dedup(self):
+        RELEASE["tag"] = "v1.3.0"
+        with open(ilink.CONTACTS_FILE, "w") as f:
+            json.dump({"owner-1": {"context_token": "ctx",
+                                   "updated_at": int(time.time())},
+                       "owner-2": {"context_token": "ctx",
+                                   "updated_at": int(time.time())}}, f)
+        with open(os.path.join(DATA_DIR, "owner.json"), "w") as f:
+            json.dump({"owner_ids": ["owner-1", "owner-2"]}, f)
+        with open(ilink.VERSION_NOTIFY_FILE, "w") as f:
+            json.dump({"subscribed": ["owner-1", "owner-2"],
+                       "notified": {"owner-1": "v1.3.0"}}, f)
+        code, out = run_check(notify=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(SENDS, ["owner-2"])
 
     def test_fetch_failure(self):
         RELEASE["tag"] = None
@@ -137,6 +167,7 @@ class VersionCheckTest(unittest.TestCase):
 
     def test_notify_without_context_token(self):
         RELEASE["tag"] = "v1.3.0"
+        self._set_subscribed(["owner-1"])
         with open(ilink.CONTACTS_FILE, "w") as f:
             json.dump({}, f)
         code, out = run_check(notify=True)

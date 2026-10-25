@@ -40,8 +40,9 @@ within 10 minutes to bind this account as its owner."** Then wait for
 the command to finish:
 
 - `BIND_OK:<id>` — bound. The bot has already sent the new owner a
-  three-part welcome (a greeting; what being Owner means; "you can talk
-  to me now"), the sender's context token is cached, and the binding
+  four-part welcome (a greeting; what being Owner means; "you can talk
+  to me now"; a question asking whether to subscribe to release
+  reminders), the sender's context token is cached, and the binding
   message itself is consumed — it was just the knock on the door. Now
   start the driver (step 2) and ask the user for a normal test message.
 - `BIND_TIMEOUT` (exit code 3) — nobody messaged the bot within the
@@ -100,6 +101,22 @@ atomic `mv`. When woken, handle the batch under this contract:
   message is media). Treat "this / that message" as referring to
   `quoted_text`; with only a fragment, go by the fragment; with
   neither, say the original is not visible instead of guessing it.
+- Release-reminder subscription (check this BEFORE composing a normal
+  reply): the owner's message is a subscription decision, not chat,
+  when it is exactly `订阅` / `订阅更新` (subscribe) or `取消订阅`
+  (unsubscribe) — run `ilink.py subscribe <owner_id>` /
+  `ilink.py unsubscribe <owner_id>` and let the reply BE the short
+  confirmation ("已订阅，有新版时我会在微信上告诉你" /
+  "已取消订阅"), no extra chat on top. Also, when a
+  `subscribe_ask.json` marker exists and is fresher than 24 hours
+  (the welcome just asked the question), an affirmative owner reply
+  (是 / 好 / 好的 / 要 / 可以 / 订阅) means subscribe, and a negative
+  one (不 / 不用 / 算了 / 不要) means decline: run the matching
+  command — it clears the marker either way — and never ask again. A
+  marker older than 24 hours is stale: ignore it, do not interpret
+  the reply as a subscription answer. `version-check --notify` only
+  notifies subscribed owners, so never promise reminders to an
+  unsubscribed owner.
 - Replies may use Markdown: the WeChat client renders headings, bold,
   italic, inline code, code blocks (with a language label, copy button
   and syntax highlighting), lists, links, tables, strikethrough,

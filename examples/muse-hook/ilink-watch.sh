@@ -137,6 +137,19 @@ aset() {
   mv "$tmp" "$ALERT" 2>/dev/null || true
 }
 
+# 更新提醒：每小时最多跑一次 version-check --notify（后台跑，不阻塞
+# 消息处理；未订阅时它只打印 NO_SUBSCRIBERS，不发任何消息）
+vc_last=$(astate vc_last)
+case "$vc_last" in ''|*[!0-9]*) vc_last=0 ;; esac
+if [ "$vc_last" -eq 0 ] || [ $((NOW - vc_last)) -ge 3600 ]; then
+  aset vc_last "$NOW"
+  if [ "$DRY" != "1" ]; then
+    (python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" version-check --notify >/dev/null 2>&1 &) || true
+  else
+    silent "dry-run: would run version-check --notify"
+  fi
+fi
+
 # 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
 # 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
 # 注意：必须用 -cmin（inode 变更时间）而非 -mmin（内容修改时间）：
