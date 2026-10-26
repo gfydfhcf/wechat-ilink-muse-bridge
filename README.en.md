@@ -346,6 +346,23 @@ The data directory defaults to `./data/` and can be overridden with the
   exactly (subscribe/unsubscribe/install update) use exact keyword
   matching instead of slashes.
 
+## Incident log: the night the bot sent "--key"
+
+At 00:11 on Oct 27, 2026, the owner told the bot good night before bed
+("a 醇我涂完了，我要睡觉了，晚安" — night routine done, off to sleep).
+The bot meant to reply "涂完就好，晚安，好好睡" (nicely done, good
+night, sleep well). What actually arrived was this:
+
+  <img src="docs/key-incident.jpg" alt="Screenshot of the bot replying '--key' to the owner's good night" width="300">
+
+What happened: the worker dropped the `-` text placeholder while
+assembling the send command, so the dedup flag `--key` slid into the
+text slot — and the bridge, which validated nothing about the text,
+sent it verbatim. The guard added afterwards: send/proactive now
+validate the text before any API call, and empty text or text starting
+with `--` is refused outright and only logged as refused. A malformed
+call now fails loudly instead of delivering a flag as a message.
+
 ## Security notes
 
 `data/session.json` is a **login credential**, equivalent to a password: keep
