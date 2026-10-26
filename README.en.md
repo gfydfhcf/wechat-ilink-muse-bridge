@@ -300,6 +300,20 @@ The data directory defaults to `./data/` and can be overridden with the
   never renders), tool progress fails one step earlier: no message is
   created at all. No workaround for now; while the worker is busy, the
   "typing…" indicator remains the only progress signal.
+- **Outbound quotes don't work (channel-side, tested)**: the bot can
+  restore messages you quote (local quote cache), but it cannot send a
+  quoted reply itself. Tested (Oct 26, 2026): adding `ref_msg` to
+  sendmessage in both shapes seen on the inbound side (nested
+  `message_item.msg_id` and flat `msg_id`) — the server returned a
+  message_id and delivered both times, but WeChat rendered them as plain
+  messages with no quoted original above. No quote field exists in the
+  sendmessage structures of three independent SDKs either. Conclusion:
+  the outbound message schema has no quote concept at all — this is not
+  a formatting issue. Inbound and outbound are asymmetric: inbound full
+  quotes carry only the quoted msg_id (svr_id is just a fallback lookup
+  for refs that carry only svr_id), while outbound has no corresponding
+  field. This project therefore does not implement outbound quoting, and
+  does not fake it by pasting the original text into the message body.
 - **Session lifetime is uncertain**: early community reports suggested
   roughly 24 hours, but in production a single login here has stayed valid
   for 3+ days (Oct 2026); it may vary by account. Expiry means a human has
