@@ -2051,6 +2051,19 @@ def _proactive_needs_tokenless_retry(data, require_message_id=False):
 
 
 @_keyed_send_locked
+def _validate_send_text(text):
+    """发送正文守卫：空正文、或以 -- 开头的正文一律拒绝。
+    2026-10-27 00:11 事故：worker 的 send 命令丢了正文占位符 '-'，
+    '--key' 滑进正文位置被原样发出。桥此前对正文无任何校验，
+    于是标志被当成消息发给了用户。本守卫让这类传错只报错、不发出。
+    返回 None 表示通过，否则返回错误码。"""
+    if text is None or text.strip() == "":
+        return "SEND_TEXT_EMPTY"
+    if text.strip().startswith("--"):
+        return "SEND_TEXT_LOOKS_LIKE_FLAG"
+    return None
+
+
 def cmd_proactive(to_user_id, text, key=None):
     """主动推送：先用缓存的 context_token，失败则去掉 token 重试一次。"""
     s = load_session()
@@ -2060,6 +2073,12 @@ def cmd_proactive(to_user_id, text, key=None):
         return 1
     if text == "-":
         text = sys.stdin.read()
+    _text_err = _validate_send_text(text)
+    if _text_err:
+        # 拒绝在任何 API 调用之前：不落账本意图、不发消息，只记审计。
+        _audit_send("proactive", to_user_id, None, "refused", error=_text_err)
+        print(f"{_text_err}: refusing to send empty or flag-like text")
+        return 1
     if key:
         try:
             client_id, already_sent = _resolve_send_intent(key)
@@ -2159,6 +2178,12 @@ def cmd_send(to_user_id, context_token, text, key=None):
         return 1
     if text == "-":
         text = sys.stdin.read()
+    _text_err = _validate_send_text(text)
+    if _text_err:
+        # 拒绝在任何 API 调用之前：不落账本意图、不发消息，只记审计。
+        _audit_send("send", to_user_id, None, "refused", error=_text_err)
+        print(f"{_text_err}: refusing to send empty or flag-like text")
+        return 1
     if key:
         try:
             client_id, already_sent = _resolve_send_intent(key)
