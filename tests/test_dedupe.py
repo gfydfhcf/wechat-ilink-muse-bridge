@@ -100,11 +100,20 @@ class FilterSeenTest(unittest.TestCase):
     def test_cap_rolls_off_oldest(self):
         _, ids = ilink.filter_seen([msg(i) for i in range(ilink.SEEN_CAP + 100)])
         ilink.mark_seen(ids)
+        # S3: a single batch larger than the cap is kept whole —
+        # truncating it would silently lose dedupe for the dropped ids.
         seen = ilink.load_seen()
-        self.assertEqual(len(seen), ilink.SEEN_CAP)
-        # The most recent id is still blocked, the rolled-off oldest is not.
+        self.assertEqual(len(seen), ilink.SEEN_CAP + 100)
+        # The most recent id is still blocked.
         kept, _ = ilink.filter_seen([msg(ilink.SEEN_CAP + 99)])
         self.assertEqual(kept, [])
+        # A later small batch rolls the store back down to the cap,
+        # dropping the oldest ids first.
+        _, more = ilink.filter_seen([msg(i) for i in range(ilink.SEEN_CAP + 100,
+                                                          ilink.SEEN_CAP + 200)])
+        ilink.mark_seen(more)
+        seen = ilink.load_seen()
+        self.assertEqual(len(seen), ilink.SEEN_CAP)
         kept, _ = ilink.filter_seen([msg(0)])
         self.assertEqual(len(kept), 1)
 

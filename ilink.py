@@ -89,6 +89,8 @@ MEDIA_MAX_BYTES = 100 * 1024 * 1024  # media sends refuse above this size:
 # POST, so a send reads the file fully into memory (plus ciphertext).
 # Refusing up front beats letting a huge file exhaust process memory;
 # chunked upload would need a protocol change and is out of scope.
+# Downloads share the same cap (M3): an inbound item larger than this
+# is refused before its ciphertext can exhaust poll's memory.
 MEDIA_DIR = os.path.join(BRIDGE, "media")
 CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 
@@ -192,11 +194,24 @@ def download_media_item(item: dict, item_type: int):
             last_err = f"{type(e).__name__}:{str(e)[:100]}"
             time.sleep(2 * (attempt + 1))
             continue
+        if total is not None and total > MEDIA_MAX_BYTES:
+            # M3: the send side refuses above MEDIA_MAX_BYTES; the
+            # download side used to have no cap at all. Refuse before
+            # any more bytes accumulate.
+            print(f"MEDIA_ERROR:too large {total}>{MEDIA_MAX_BYTES}",
+                  file=sys.stderr, flush=True)
+            return None
         if status == 206 and len(ciphertext):
             ciphertext += chunk
         else:
             # 200 或服务器忽略 Range：以本次响应为准（可能是不完整的，靠 complete/total 判断）
             ciphertext = chunk
+        if len(ciphertext) > MEDIA_MAX_BYTES:
+            # A server that lies about total (or omits it) still
+            # cannot grow the buffer past the cap.
+            print(f"MEDIA_ERROR:too large {len(ciphertext)}>{MEDIA_MAX_BYTES}",
+                  file=sys.stderr, flush=True)
+            return None
         last_err = "ok" if complete else f"short read {len(ciphertext)}/{total}"
         if total is not None and len(ciphertext) >= total:
             break
@@ -401,13 +416,30 @@ def _load_version_notify():
         return {}
 
 
+def _atomic_write(path, writer, mode=0o600):
+    """Atomically replace path with writer(f) output.
+
+    The tmp name carries pid + thread id: two writers used to share
+    one fixed "<target>.tmp" name, so one's half-written tmp could be
+    renamed over the other's finished write, or vanish under it and
+    break os.replace with FileNotFoundError. Pid alone is not enough
+    — threads of one process share a pid and still collide (caught by
+    the concurrent-write regression test). With a unique tmp name
+    each replace is still atomic, and the worst case degrades to
+    last-writer-wins (acceptable for these state files) instead of a
+    torn or missing file. mode=None skips chmod (for files that
+    deliberately keep the default mode)."""
+    tmp = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+    with open(tmp, "w") as f:
+        writer(f)
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
 def _save_version_notify(state):
     try:
-        tmp = VERSION_NOTIFY_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(state, f)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, VERSION_NOTIFY_FILE)
+        _atomic_write(VERSION_NOTIFY_FILE, lambda f: json.dump(state, f))
     except Exception:
         pass
 
@@ -484,12 +516,24 @@ def cmd_version_check(notify=False):
     print(f"UPDATE_AVAILABLE:{tag}")
     if not notify:
         return 0
+    return _version_notify_locked(tag, rel)
+
+
+VERSION_NOTIFY_LOCK_FILE = os.path.join(BRIDGE, "version_notify.lock")
+
+
+def _do_version_notify(tag, rel):
+    """Send one proactive update notice to each subscribed owner not
+    yet notified for this tag. Callers must hold the version-notify
+    lock across this call (see _version_notify_locked): the
+    load → send → save sequence is only once-per-owner-per-tag when
+    two concurrent runs cannot both observe the same pending set."""
     state = _load_version_notify()
     subscribed = state.get("subscribed") or []
     notified = state.get("notified") or {}
     if not subscribed:
         print("NO_SUBSCRIBERS")
-        return 1
+        return 0  # nobody to notify: quiet success, not a cron failure
     pending = [o for o in subscribed if notified.get(o) != tag]
     if not pending:
         return 0  # everyone already notified for this tag: quiet success
@@ -520,6 +564,29 @@ def cmd_version_check(notify=False):
     if not sent_any:
         return last_code or 1
     return 0
+
+
+def _version_notify_locked(tag, rel):
+    """Run _do_version_notify under an inter-process flock so two
+    concurrent version-check runs cannot double-send. Falls back to
+    unlocked on platforms without fcntl (same policy as the quote
+    cache lock)."""
+    fd = None
+    if fcntl is not None:
+        try:
+            fd = os.open(VERSION_NOTIFY_LOCK_FILE,
+                         os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except Exception:
+            fd = None
+    try:
+        return _do_version_notify(tag, rel)
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 UPDATE_OFFER_FILE = os.path.join(BRIDGE, "update_offer.json")
@@ -559,6 +626,22 @@ UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/gfydfhcf/"
                    "wechat-ilink-muse-bridge")
 UPDATE_COMPARE_URL = ("https://api.github.com/repos/gfydfhcf/"
                       "wechat-ilink-muse-bridge/compare")
+UPDATE_RELEASE_URL = ("https://api.github.com/repos/gfydfhcf/"
+                      "wechat-ilink-muse-bridge/releases/tags")
+
+
+def _release_ilink_sha256(head):
+    """Return the ilink.py sha256 published in the release notes for
+    <head>, or None when the notes carry none. The notes are the only
+    channel: the compare API lists changed files but no hashes. Only
+    a line like 'ilink.py sha256: <64 hex>' counts; anything else
+    means 'no hash published' (warn, don't fail)."""
+    rel = _github_get_json(f"{UPDATE_RELEASE_URL}/{head}")
+    body = (rel or {}).get("body") or ""
+    m = re.search(r"ilink\.py\s+sha256:\s*([0-9a-fA-F]{64})", body)
+    if m:
+        return m.group(1).lower()
+    return None
 HOOK_SCRIPT_FILES = ("ilink-watch.sh", "ilink-warm-wait.sh")
 # Watchdog default: the hook runs every ~5s, so a heartbeat older than
 # 30 minutes means ~360 missed runs — a near-zero false-positive
@@ -680,6 +763,20 @@ def cmd_update_to(tag, hook_dir=None, script_path=None):
         # not bumped to the tag refuses to install.
         print("UPDATE_FAILED:verify:version_mismatch")
         return 1
+    published_hash = _release_ilink_sha256(head)
+    if published_hash:
+        import hashlib
+        actual_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
+        if actual_hash != published_hash:
+            print("UPDATE_FAILED:verify:hash_mismatch")
+            return 1
+    else:
+        # Optional check by design: releases that do not publish a
+        # hash install as before, but loudly, so a missing hash can
+        # never pass silently.
+        print(f"WARNING: no ilink.py sha256 in release notes for "
+              f"{head}; installing without hash check",
+              file=sys.stderr, flush=True)
     plan.append(("ilink.py", script_path, src))
     script_lines = []
     if hook_dir and not compare_ok:
@@ -714,6 +811,15 @@ def cmd_update_to(tag, hook_dir=None, script_path=None):
             plan.append(("AGENTS.md.new",
                          os.path.join(BRIDGE, "AGENTS.md.new"), content))
             contract_line = "CONTRACT:AGENTS.md.new"
+        else:
+            # Loud but non-fatal: the contract changed but its new
+            # text could not be fetched (a transient failure must not
+            # block an otherwise good update), yet the worker must
+            # not walk away believing the contract is unchanged.
+            print("WARNING: AGENTS.md changed in this release but its "
+                  "download failed; contract NOT updated — sync "
+                  "AGENTS.md manually", file=sys.stderr, flush=True)
+            contract_line = "CONTRACT:AGENTS.md:download-failed"
     # Phase 2: backup + atomic swap, then re-verify from disk.
     backed = []  # (target, backup_path or None)
     try:
@@ -787,11 +893,7 @@ def load_contacts():
 
 def save_contacts(c):
     os.makedirs(BRIDGE, exist_ok=True)
-    tmp = CONTACTS_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(c, f)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CONTACTS_FILE)
+    _atomic_write(CONTACTS_FILE, lambda f: json.dump(c, f))
 
 
 # --- Quote cache ------------------------------------------------------------
@@ -850,11 +952,8 @@ def _trim_quote_cache(cache):
 
 def _save_quote_cache(cache):
     _trim_quote_cache(cache)
-    tmp = QUOTE_CACHE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(cache, f, ensure_ascii=False)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, QUOTE_CACHE_FILE)
+    _atomic_write(QUOTE_CACHE_FILE,
+                  lambda f: json.dump(cache, f, ensure_ascii=False))
 
 
 def _quote_cache_upsert(entries, svr_map=None):
@@ -951,13 +1050,16 @@ def load_seen():
         return []
 
 
-def save_seen(ids):
+def save_seen(ids, keep=SEEN_CAP):
+    """Persist seen ids, keeping at most `keep` (default SEEN_CAP).
+
+    keep is max(SEEN_CAP, latest batch size) at the mark_seen call
+    site: a single batch larger than the cap must not roll off its
+    own early ids before the cursor is even written, or a failed
+    cursor write followed by a redelivery would slip past the filter
+    and duplicate replies."""
     os.makedirs(BRIDGE, exist_ok=True)
-    tmp = SEEN_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(ids[-SEEN_CAP:], f)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, SEEN_FILE)
+    _atomic_write(SEEN_FILE, lambda f: json.dump(ids[-keep:], f))
 
 
 def filter_seen(raw_msgs):
@@ -991,7 +1093,7 @@ def mark_seen(ids):
     have = set(seen)
     merged = seen + [i for i in (str(x) for x in ids) if i not in have]
     if len(merged) != len(seen):
-        save_seen(merged)
+        save_seen(merged, keep=max(SEEN_CAP, len(ids)))
 
 
 def load_owner_ids():
@@ -1033,11 +1135,7 @@ def note_unknown_sender(from_id):
     if len(book) > 100:
         book = dict(sorted(book.items(),
                            key=lambda kv: kv[1].get("last_seen", 0))[-100:])
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(book, f)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    _atomic_write(path, lambda f: json.dump(book, f))
 
 
 # --- First-owner binding ----------------------------------------------------
@@ -1071,11 +1169,7 @@ def _bind_lock_path():
 
 
 def _save_json_atomic(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    _atomic_write(path, lambda f: json.dump(data, f, ensure_ascii=False))
 
 
 def save_owner(owner_id):
@@ -1103,10 +1197,18 @@ def clear_bind_state():
         pass
 
 
+def _bind_lock_token():
+    return f"{os.getpid()}-{random.randint(0, 0xFFFFFFFF):08x}"
+
+
 def _acquire_bind_lock():
     """Single-window lock: two bind commands must never race for the first
-    sender. A lock older than 15 minutes is treated as stale (the holder
-    died) and taken over once."""
+    sender. Returns (fd, token), or None when another window holds the
+    lock. A lock older than 15 minutes is treated as stale ONLY when
+    its owner pid is dead (or the lock file is unreadable) — a slow
+    holder past 900s must not lose its window to a second bind. The
+    token is verified on release, so a holder can never delete a lock
+    it does not own."""
     path = _bind_lock_path()
     for _ in range(2):
         try:
@@ -1114,25 +1216,54 @@ def _acquire_bind_lock():
         except FileExistsError:
             try:
                 if time.time() - os.path.getmtime(path) > 900:
-                    os.remove(path)
-                    continue
+                    try:
+                        with open(path) as f:
+                            old = json.load(f)
+                        pid = old.get("pid")
+                    except Exception:
+                        pid = None
+                    alive = False
+                    if pid:
+                        try:
+                            os.kill(pid, 0)
+                            alive = True
+                        except OSError:
+                            alive = False
+                    if not alive:
+                        os.remove(path)
+                        continue
             except FileNotFoundError:
                 continue
             return None
+        token = _bind_lock_token()
         os.write(fd, json.dumps(
-            {"pid": os.getpid(), "started_at": int(time.time())}).encode())
-        return fd
+            {"pid": os.getpid(), "token": token,
+             "started_at": int(time.time())}).encode())
+        return (fd, token)
     return None
 
 
-def _release_bind_lock(fd):
+def _release_bind_lock(lock):
+    """Release a lock from _acquire_bind_lock: only remove the lock
+    file when its token still matches (a stolen or replaced lock is
+    left alone). Accepts the (fd, token) tuple, or a bare fd for
+    backward compatibility (token check skipped)."""
+    if isinstance(lock, tuple):
+        fd, token = lock
+    else:
+        fd, token = lock, None
     try:
         os.close(fd)
     except Exception:
         pass
     try:
+        if token is not None:
+            with open(_bind_lock_path()) as f:
+                current = json.load(f)
+            if current.get("token") != token:
+                return
         os.remove(_bind_lock_path())
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError, OSError):
         pass
 
 
@@ -1214,8 +1345,8 @@ def cmd_bind(wait_secs=BIND_DEFAULT_SECONDS):
         primary = sorted(owners)[0]
         print(f"ALREADY_BOUND:{primary}")
         return 0
-    lock_fd = _acquire_bind_lock()
-    if lock_fd is None:
+    lock = _acquire_bind_lock()
+    if lock is None:
         print("BIND_IN_PROGRESS")
         return 4
     try:
@@ -1307,7 +1438,7 @@ def cmd_bind(wait_secs=BIND_DEFAULT_SECONDS):
         print("BIND_TIMEOUT")
         return 3
     finally:
-        _release_bind_lock(lock_fd)
+        _release_bind_lock(lock)
 
 
 def headers(token=None):
@@ -1348,11 +1479,7 @@ def load_session():
 
 def save_session(s):
     os.makedirs(BRIDGE, exist_ok=True)
-    tmp = SESSION_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(s, f)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, SESSION_FILE)
+    _atomic_write(SESSION_FILE, lambda f: json.dump(s, f))
 
 
 def _fetch_qrcode():
@@ -1486,7 +1613,10 @@ def cmd_login(qrcode, wait_secs=300):
                 print(f"QR_REFRESH_ERROR:{e}", flush=True)
                 return 1
             qrcode = _print_qrcode(data)
-            deadline = time.time() + wait_secs
+            # L14: keep the ORIGINAL deadline — refreshing the QR
+            # must not silently stretch the wait (3 refreshes used to
+            # turn 300s into 1200s). The loop exits on the original
+            # deadline with LOGIN_TIMEOUT.
             continue
         if status == "canceled":
             print(f"LOGIN_FAILED:{status}")
@@ -1519,11 +1649,8 @@ def _note_token_stale():
     except Exception:
         first = now
     try:
-        tmp = TOKEN_STALE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"first_seen": first}, f)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, TOKEN_STALE_FILE)
+        _atomic_write(TOKEN_STALE_FILE,
+                      lambda f: json.dump({"first_seen": first}, f))
     except Exception:
         pass
     return now - first
@@ -1574,7 +1701,8 @@ def cmd_poll():
     filtered_senders = []
     msgs = []
     contacts = load_contacts()
-    quote_cache = _load_quote_cache()
+    contacts_dirty = False  # L1: only write contacts when this round changed them
+    quote_cache = None  # L2: lazy — loaded on the first ref_msg, not every round
     pending_entries = {}
     pending_svr = {}
     for m in fresh:
@@ -1603,6 +1731,8 @@ def cmd_poll():
         if m.get("message_type") != 1:  # 只要用户发来的消息
             continue
         from_id = m.get("from_user_id")
+        if from_id is not None:
+            from_id = str(from_id)
         if from_id not in owners:
             # Owner allowlist (code-enforced): a stranger's message is
             # never queued, never wakes the worker and never lands in
@@ -1617,7 +1747,13 @@ def cmd_poll():
             continue
         ctx = m.get("context_token")
         if from_id and ctx:
-            contacts[from_id] = {"context_token": ctx, "updated_at": int(time.time())}
+            # Merge, don't replace: the entry may also carry a cached
+            # typing_ticket, which a whole-entry overwrite would drop
+            # on every inbound message (forcing a getconfig re-fetch
+            # exactly when typing is needed most).
+            contacts.setdefault(from_id, {}).update(
+                {"context_token": ctx, "updated_at": int(time.time())})
+            contacts_dirty = True
         cache_parts = []
         cache_kinds = []
         cache_media_path = None
@@ -1659,7 +1795,11 @@ def cmd_poll():
                 except Exception as e:
                     entry["media_error"] = str(e)[:100]
             else:
-                continue
+                # Unknown item type: never drop silently. The worker
+                # must at least see that something arrived; the id
+                # still flows into the commit block, so the cursor
+                # advances exactly as before — only the loss is fixed.
+                entry["text"] = f"[未知消息类型 {t}]"
             ref_msg = item.get("ref_msg")
             if isinstance(ref_msg, dict) and ref_msg:
                 ref_item = ref_msg.get("message_item") or {}
@@ -1673,6 +1813,8 @@ def cmd_poll():
                         pending_svr[str(ref_msg["svr_id"])] = str(ref_item["msg_id"])
                 if ref_msg.get("title"):
                     entry["quoted_title"] = ref_msg["title"]
+                if quote_cache is None:
+                    quote_cache = _load_quote_cache()
                 resolved, fragment = _quote_resolve(
                     quote_cache, pending_entries, pending_svr, ref_msg)
                 if resolved:
@@ -1693,7 +1835,7 @@ def cmd_poll():
             pending_entries[str(m["message_id"])] = cache_entry
     if pending_entries or pending_svr:
         _quote_cache_upsert(pending_entries, pending_svr)
-    if contacts:
+    if contacts_dirty:
         save_contacts(contacts)
     # Two-phase commit: do NOT advance the cursor or record seen ids
     # here. The caller (hook script / daemon) queues the batch durably,
@@ -1724,8 +1866,20 @@ def cmd_commit():
     except Exception as e:
         print(f"COMMIT_ERROR:bad stdin: {e}")
         return 1
-    mark_seen(payload.get("ids") or [])
+    if not isinstance(payload, dict):
+        print("COMMIT_ERROR:payload must be an object")
+        return 1
+    ids = payload.get("ids") or []
+    if not isinstance(ids, list):
+        # A string id list would otherwise be recorded char by char
+        # into seen_ids, polluting the dedupe filter.
+        print("COMMIT_ERROR:ids must be a list")
+        return 1
     cursor = payload.get("cursor")
+    if cursor is not None and not isinstance(cursor, str):
+        print("COMMIT_ERROR:cursor must be a string")
+        return 1
+    mark_seen(ids)
     if cursor:
         s = load_session()
         s["cursor"] = cursor
@@ -1776,15 +1930,17 @@ def _audit_send(direction, to_user_id, client_id, result, error=None,
         with open(SEND_AUDIT_FILE, "a") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         try:
+            os.chmod(SEND_AUDIT_FILE, 0o600)
+        except Exception:
+            pass
+        try:
             with open(SEND_AUDIT_FILE) as f:
                 lines = f.readlines()
         except Exception:
             return
         if len(lines) > SEND_AUDIT_CAP:
-            tmp = SEND_AUDIT_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                f.writelines(lines[-SEND_AUDIT_CAP:])
-            os.replace(tmp, SEND_AUDIT_FILE)
+            _atomic_write(SEND_AUDIT_FILE,
+                          lambda f: f.writelines(lines[-SEND_AUDIT_CAP:]))
     except Exception:
         pass
 
@@ -1867,11 +2023,7 @@ def _write_send_ledger(book):
     dedupe can no longer cover it). tmp+replace already gives
     atomicity; no fsync by design (a torn write is impossible, a lost
     write is reported loudly instead)."""
-    tmp = SEND_LEDGER_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(book, f)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, SEND_LEDGER_FILE)
+    _atomic_write(SEND_LEDGER_FILE, lambda f: json.dump(book, f))
 
 
 def _prune_send_ledger(book, now):
@@ -2028,7 +2180,14 @@ def _classify_send_response(data, require_message_id=False):
     """Shared send/proactive outcome rule: 'ok' | 'token_expired' | 'app_error'.
     code -14 is always token expiry; code != 0 is an application failure.
     When require_message_id is set (media sends), a code-0 response with
-    no message_id is also an application failure, not a success."""
+    no message_id is also an application failure, not a success.
+    Contract note (S5, deliberately NOT enforced): text sends accept
+    code==0 without message_id, while media sends require it. The
+    standing contract is that the server always returns message_id for
+    a successful text send, so a code-0 reply without one would be a
+    server-contract surprise (currently accepted, not failed); aligning
+    text with media here would change success semantics and is left
+    for a separate decision."""
     code = data.get("code", 0)
     if code == -14:
         return "token_expired"
@@ -2050,7 +2209,6 @@ def _proactive_needs_tokenless_retry(data, require_message_id=False):
     return "prepare failed" in str(data.get("errmsg", ""))
 
 
-@_keyed_send_locked
 def _validate_send_text(text):
     """发送正文守卫：空正文、或以 -- 开头的正文一律拒绝。
     2026-10-27 00:11 事故：worker 的 send 命令丢了正文占位符 '-'，
@@ -2064,6 +2222,7 @@ def _validate_send_text(text):
     return None
 
 
+@_keyed_send_locked
 def cmd_proactive(to_user_id, text, key=None):
     """主动推送：先用缓存的 context_token，失败则去掉 token 重试一次。"""
     s = load_session()
@@ -2215,11 +2374,14 @@ def cmd_send(to_user_id, context_token, text, key=None):
             "client_id": client_id,
             "message_type": 2,
             "message_state": 2,
-            "context_token": context_token,
             "item_list": [{"type": 1, "text_item": {"text": text}}],
         },
         "base_info": {"channel_version": "1.0.2"},
     }
+    if context_token:
+        # L15: align with _send_raw, which only sends a truthy
+        # context_token; a null key used to be sent unconditionally.
+        body["msg"]["context_token"] = context_token
     for attempt in (1, 2):
         try:
             t0 = time.time()
@@ -2311,8 +2473,12 @@ def cmd_typing(to_user_id, status_word):
                     "base_info": {"channel_version": "1.0.2"}},
                    token=token, timeout=20)
         if data.get("ret", 0) != 0:
-            # ticket 可能已失效，强制刷新后重试一次
+            # ticket 可能已失效，强制刷新后重试一次；刷新仍无票据时
+            # 直接报错，不要发一次必然失败的请求。
             ticket = _typing_ticket(to_user_id, token, force=True)
+            if not ticket:
+                print("NO_TYPING_TICKET")
+                return 1
             data = api("POST", "ilink/bot/sendtyping",
                        {"ilink_user_id": to_user_id, "typing_ticket": ticket,
                         "status": status,
@@ -2759,12 +2925,17 @@ def cmd_health(offline=False):
             "inspected or moved away")
 
     poll_log = os.path.join(BRIDGE, "poll.log")
-
-    poll_log = os.path.join(BRIDGE, "poll.log")
     if os.path.exists(poll_log):
         try:
-            with open(poll_log) as f:
-                tail = [ln.strip() for ln in f if ln.strip()]
+            # L4: read only the tail — poll.log is append-only and
+            # unbounded, and health only needs its last line.
+            with open(poll_log, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 8192))
+                tail = [ln.strip() for ln in
+                        f.read().decode("utf-8", "replace").splitlines()
+                        if ln.strip()]
             if tail:
                 lines.append(f"poll: last error {tail[-1][:90]}")
         except Exception:
@@ -2983,10 +3154,9 @@ def cmd_watchdog(max_age_mins=WATCHDOG_MAX_AGE_MINS):
 
     def _set_alerted(value):
         try:
-            tmp = state_path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({"alerted": value}, f)
-            os.replace(tmp, state_path)
+            _atomic_write(state_path,
+                          lambda f: json.dump({"alerted": value}, f),
+                          mode=None)
         except Exception:
             pass
 
@@ -3181,14 +3351,17 @@ def cmd_stats():
             for line in f:
                 try:
                     entry = json.loads(line)
-                except ValueError:
+                    if int(entry.get("ts", 0) or 0) < today_start:
+                        continue
+                    if entry.get("result") == "ok":
+                        ok_n += 1
+                    else:
+                        fail_n += 1
+                except (ValueError, AttributeError, TypeError):
+                    # A corrupt audit line (non-numeric ts, a JSON
+                    # array instead of an object, ...) must never
+                    # crash stats: skip it and keep counting.
                     continue
-                if int(entry.get("ts", 0) or 0) < today_start:
-                    continue
-                if entry.get("result") == "ok":
-                    ok_n += 1
-                else:
-                    fail_n += 1
     except OSError:
         pass
     out.append(f"sends today: {ok_n} ok / {fail_n} failed")
@@ -3299,6 +3472,16 @@ def _pop_key(args):
     return key, rest
 
 
+def _int_arg(value, usage):
+    """Parse an int CLI arg; on failure print usage and return None
+    (callers return exit 2) instead of an uncaught ValueError."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        print(f"usage: {usage}", file=sys.stderr)
+        return None
+
+
 def _need(argv, n, usage):
     """Arg-count guard: missing args print usage to stderr and exit 2
     instead of raising a bare IndexError traceback."""
@@ -3318,9 +3501,21 @@ def main(argv):
     if cmd == "login":
         if not _need(argv, 3, "ilink.py login <qrcode> [wait_secs]"):
             return 2
-        return cmd_login(argv[2], int(argv[3]) if len(argv) > 3 else 300)
+        if len(argv) > 3:
+            wait = _int_arg(argv[3], "ilink.py login <qrcode> [wait_secs]")
+            if wait is None:
+                return 2
+        else:
+            wait = 300
+        return cmd_login(argv[2], wait)
     if cmd == "bind":
-        return cmd_bind(int(argv[2]) if len(argv) > 2 else BIND_DEFAULT_SECONDS)
+        if len(argv) > 2:
+            secs = _int_arg(argv[2], "ilink.py bind [seconds]")
+            if secs is None:
+                return 2
+        else:
+            secs = BIND_DEFAULT_SECONDS
+        return cmd_bind(secs)
     if cmd == "poll":
         return cmd_poll()
     if cmd == "commit":
@@ -3340,7 +3535,11 @@ def main(argv):
         args = argv[2:]
         for i, a in enumerate(args):
             if a == "--max-age-mins" and i + 1 < len(args):
-                age = int(args[i + 1])
+                parsed = _int_arg(args[i + 1],
+                                  "ilink.py watchdog [--max-age-mins N]")
+                if parsed is None:
+                    return 2
+                age = parsed
         return cmd_watchdog(age)
     if cmd == "rotate-chatlog":
         return cmd_rotate_chatlog()
@@ -3362,9 +3561,17 @@ def main(argv):
         args = [a for a in argv[2:] if a != "--dry-run"]
         for i, a in enumerate(args):
             if a == "--max-age-days" and i + 1 < len(args):
-                age = int(args[i + 1])
+                parsed = _int_arg(args[i + 1],
+                                  "ilink.py prune-media [--max-age-days N]")
+                if parsed is None:
+                    return 2
+                age = parsed
             if a == "--max-total-mb" and i + 1 < len(args):
-                total_mb = int(args[i + 1])
+                parsed = _int_arg(args[i + 1],
+                                  "ilink.py prune-media [--max-total-mb N]")
+                if parsed is None:
+                    return 2
+                total_mb = parsed
         return cmd_prune_media(age, total_mb * 1024 * 1024, dry_run)
     if cmd == "version-check":
         return cmd_version_check(notify="--notify" in argv)
@@ -3410,7 +3617,12 @@ def main(argv):
         if not _need(argv, 5, "ilink.py send-voice <to> <ctx> <path> [playtime_ms] [--key <id>]"):
             return 2
         key, rest = _pop_key(argv[5:])
-        playtime = int(rest[0]) if rest else 0
+        if rest:
+            playtime = _int_arg(rest[0], "ilink.py send-voice <to> <ctx> <path> [playtime_ms]")
+            if playtime is None:
+                return 2
+        else:
+            playtime = 0
         return cmd_send_media(argv[2], argv[3], argv[4], 3, playtime, key=key)
     if cmd in ("proactive-image", "proactive-file", "proactive-video"):
         if not _need(argv, 4, f"ilink.py {cmd} <to> <path> [--key <id>]"):
@@ -3423,7 +3635,12 @@ def main(argv):
         if not _need(argv, 4, "ilink.py proactive-voice <to> <path> [playtime_ms] [--key <id>]"):
             return 2
         key, rest = _pop_key(argv[4:])
-        playtime = int(rest[0]) if rest else 0
+        if rest:
+            playtime = _int_arg(rest[0], "ilink.py proactive-voice <to> <path> [playtime_ms]")
+            if playtime is None:
+                return 2
+        else:
+            playtime = 0
         return cmd_proactive_media(argv[2], argv[3], 3, playtime, key=key)
     print(__doc__)
     return 2

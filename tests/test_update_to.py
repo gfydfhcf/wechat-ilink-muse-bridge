@@ -35,11 +35,16 @@ NEW_SH = "#!/usr/bin/env bash\necho new\n"
 RAW = {"ilink.py": NEW_ILINK, "watch": NEW_SH, "warm": NEW_SH,
        "agents": "# new contract\n"}
 COMPARE = {"files": [{"filename": "ilink.py"}]}
+# L12: release notes body used by the optional sha256 check. Default
+# carries no hash, so updates proceed with a warning (as before).
+RELEASE_NOTES = {"body": ""}
 
 
 def fake_get_json(url):
     if "compare" in url:
         return COMPARE
+    if "/releases/tags/" in url:
+        return RELEASE_NOTES
     raise AssertionError(f"unexpected json url: {url}")
 
 

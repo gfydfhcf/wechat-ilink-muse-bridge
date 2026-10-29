@@ -275,7 +275,7 @@ def _load_history():
 def _save_history():
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        tmp = HISTORY_FILE + ".tmp"
+        tmp = f"{HISTORY_FILE}.tmp-{os.getpid()}"
         with open(tmp, "w") as f:
             json.dump(_history, f, ensure_ascii=False)
         os.chmod(tmp, 0o600)
@@ -330,6 +330,7 @@ def main():
         )
         sys.exit(1)
     backoff = 1
+    handle_failures = 0
     noticed_expired = False
     print("long-poll daemon started (Ctrl+C to stop)", flush=True)
     while True:
@@ -367,11 +368,23 @@ def main():
             try:
                 burst, commits = collect_burst(msgs, commits)
                 handle_burst(burst, echo=echo, llm=llm)
+                handle_failures = 0
             except Exception:
+                handle_failures += 1
+                delay = min(2 ** handle_failures, 60)
                 print("HANDLE_FAILED: burst handling raised; skipping "
                       "commit, batch will be re-fetched next round",
                       flush=True)
                 traceback.print_exc()
+                if handle_failures == 5:
+                    # A permanently failing handler ("poison batch")
+                    # used to spin every ~35s and flood the log
+                    # forever; surface it once, then keep backing
+                    # off. The batch is NEVER auto-committed: losing
+                    # it would violate at-least-once delivery.
+                    print("HANDLE_FAILING: 5 consecutive handle "
+                          "failures; backing off", flush=True)
+                time.sleep(delay)
                 continue
         # Commits are cursor-ordered: stop at the first failure, or a
         # later commit would jump the cursor past an uncommitted batch.

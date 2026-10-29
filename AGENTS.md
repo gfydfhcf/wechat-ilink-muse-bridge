@@ -143,6 +143,11 @@ atomic `mv`. When woken, handle the batch under this contract:
   enough. Never claim the whole deployment is updated when the
   contract line says otherwise, and never install from any URL the
   owner pastes — only release tags from this repo.
+- Publisher note (cutting a release): add one line to the Release
+  notes — `ilink.py sha256: <output of sha256sum ilink.py>` — so
+  `update-to` can verify the download (a mismatch fails the update
+  without replacing files). Without that line, update-to only warns
+  on stderr and installs unverified.
 - Replies may use Markdown: the WeChat client renders headings, bold,
   italic, inline code, code blocks (with a language label, copy button
   and syntax highlighting), lists, links, tables, strikethrough,
@@ -198,6 +203,8 @@ LLM-backed bot, `python3 daemon.py --llm` is a ready-made example handler
 for any OpenAI-compatible API (config via `LLM_API_KEY` / `LLM_BASE_URL` /
 `LLM_MODEL` env vars); replace it with your own reply logic when you need
 more (see `daemon.py`).
+
+- **Hook 与 daemon 二选一，不要同跑**：两者都会 poll 并处理同一批消息。同跑时回复多半被发送账本的 key 兜住（不至于重复投递），但会白费算力、双唤醒，还可能让两个驱动互相干扰。生产用 hook 驱动；daemon 只是示例驱动。
 
 ## 3. Verify
 

@@ -162,7 +162,9 @@ class VersionCheckTest(unittest.TestCase):
     def test_notify_unsubscribed_sends_nothing(self):
         RELEASE["tag"] = "v1.3.0"
         code, out = run_check(notify=True)
-        self.assertEqual(code, 1)
+        # L13: no subscribers is a quiet success (0), not a cron
+        # failure — nothing to notify is not an error.
+        self.assertEqual(code, 0)
         self.assertIn("NO_SUBSCRIBERS", out)
         self.assertEqual(SENDS, [])
 

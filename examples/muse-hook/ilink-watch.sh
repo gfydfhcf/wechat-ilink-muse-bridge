@@ -60,6 +60,20 @@ now() { date '+%Y-%m-%d %H:%M:%S'; }
 log_line() {
   [ "$DRY" = "1" ] && return 0
   echo "[$(now)] $1" >> "$POLLLOG"
+  trim_poll_log
+}
+
+# poll.log 上限：health 只读最后一行，但脚本只追加从不截断，文件会
+# 无限增长。每次写日志后只保留最近 500 行（安静轮次不写日志，所以
+# 截断本身很廉价；单实例锁保证截断时没有别的实例在写）。
+trim_poll_log() {
+  [ "$DRY" = "1" ] && return 0
+  [ -f "$POLLLOG" ] || return 0
+  local n
+  n=$(wc -l < "$POLLLOG" 2>/dev/null || echo 0)
+  if [ "$n" -gt 500 ] 2>/dev/null; then
+    tail -n 500 "$POLLLOG" > "$POLLLOG.trim.$$" && mv "$POLLLOG.trim.$$" "$POLLLOG"
+  fi
 }
 
 # 队列文件三态计数：空/不存在 -> 0；合法队列（对象 + .msgs 数组）-> 条数；
@@ -209,8 +223,11 @@ elif ! flush_commit_pending; then
   # 旧批次交叠（补交成功后旧批次的游标才推进，届时正常拉新消息）
   silent "commit retry pending, poll skipped"
 else
-  # 长轮询一轮（服务端 hold 住最多 35s）
-  out=$(python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" poll 2>/dev/null || true)
+  # 长轮询一轮（服务端 hold 住最多 35s）。timeout 120 封顶：poll 本身
+  # 是纯拉取（不推进游标、不记去重），超时只是本轮无结果、下轮重拉，
+  # 但能防止病态媒体批次把队列拖住数十分钟（单实例锁会让后续轮次
+  # 安静退出，队列实际停滞）。
+  out=$(timeout 120 python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" poll 2>/dev/null || true)
 
   if [[ "$out" == TOKEN_STALE* ]]; then
     # -14 退避窗口内：token 可能自愈，不告警、不记 poll 故障，下轮再看
@@ -244,6 +261,7 @@ else
     # 崩溃若不进本分支，会被误判成"没有新消息"、故障永远不告警。
     if [ "$DRY" != "1" ]; then
       echo "[$(now)] $(printf '%s' "${out:-POLL_CRASH:empty-or-invalid-output}" | head -c 200)" >> "$POLLLOG"
+      trim_poll_log
     fi
     err_since=$(astate err_since)
     if [ "$err_since" -eq 0 ]; then
@@ -300,6 +318,7 @@ else
           rm -f "$COMMIT_PENDING"
         else
           echo "[$(now)] COMMIT_FAILED: payload kept in $COMMIT_PENDING, retried next round" >> "$POLLLOG"
+          trim_poll_log
         fi
       fi
     }
