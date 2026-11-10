@@ -14,6 +14,7 @@ Run from the repo root:
     # or: python3 tests/test_update_to.py
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -234,6 +235,75 @@ class UpdateToTest(unittest.TestCase):
         self.assertIn("UPDATE_FAILED:swap", out)
         self.assertIn("ROLLED_BACK", out)
         self.assertEqual(self.read(self.script), OLD_ILINK)
+
+    # BRIDGE preservation (v1.3.2): a deployment's local BRIDGE
+    # override must survive update-to; the release file always
+    # carries the repo default.
+    REPO_DEFAULT_BRIDGE = (
+        'BRIDGE = os.environ.get(\n'
+        '    "ILINK_DATA_DIR",\n'
+        '    os.path.join(os.path.dirname(os.path.abspath(__file__)), '
+        '"data"),\n'
+        ')\n')
+    OLD_WITH_OVERRIDE = ('VERSION = "1.2.0"\n'
+                         'BRIDGE = os.path.expanduser("~/my-bridge")\n'
+                         'print("old")\n')
+    NEW_WITH_DEFAULT = ('VERSION = "1.3.0"\n' + REPO_DEFAULT_BRIDGE
+                        + 'print("new")\n')
+    EXPECTED_PRESERVED = ('VERSION = "1.3.0"\n'
+                          'BRIDGE = os.path.expanduser("~/my-bridge")\n'
+                          'print("new")\n')
+
+    def test_bridge_override_preserved(self):
+        with open(self.script, "w") as f:
+            f.write(self.OLD_WITH_OVERRIDE)
+        RAW["ilink.py"] = self.NEW_WITH_DEFAULT
+        code, out = run_update("v1.3.0", script_path=self.script)
+        self.assertEqual(code, 0)
+        self.assertIn("UPDATE_OK:v1.3.0", out)
+        self.assertIn("PRESERVED:BRIDGE", out)
+        self.assertEqual(self.read(self.script), self.EXPECTED_PRESERVED)
+        # The backup keeps the pre-update file, override included.
+        self.assertEqual(self.read(self.script + ".bak-v1.3.0"),
+                         self.OLD_WITH_OVERRIDE)
+
+    def test_bridge_identical_no_preserve(self):
+        old = ('VERSION = "1.2.0"\n' + self.REPO_DEFAULT_BRIDGE
+               + 'print("old")\n')
+        with open(self.script, "w") as f:
+            f.write(old)
+        RAW["ilink.py"] = self.NEW_WITH_DEFAULT
+        code, out = run_update("v1.3.0", script_path=self.script)
+        self.assertEqual(code, 0)
+        self.assertNotIn("PRESERVED:BRIDGE", out)
+        self.assertEqual(self.read(self.script), self.NEW_WITH_DEFAULT)
+
+    def test_bridge_override_preserved_with_hash(self):
+        # The published hash is checked on the pristine download,
+        # before the override is spliced in.
+        digest = hashlib.sha256(
+            self.NEW_WITH_DEFAULT.encode("utf-8")).hexdigest()
+        old_body = RELEASE_NOTES["body"]
+        RELEASE_NOTES["body"] = f"ilink.py sha256: {digest}"
+        try:
+            with open(self.script, "w") as f:
+                f.write(self.OLD_WITH_OVERRIDE)
+            RAW["ilink.py"] = self.NEW_WITH_DEFAULT
+            code, out = run_update("v1.3.0", script_path=self.script)
+        finally:
+            RELEASE_NOTES["body"] = old_body
+        self.assertEqual(code, 0)
+        self.assertIn("PRESERVED:BRIDGE", out)
+        self.assertEqual(self.read(self.script), self.EXPECTED_PRESERVED)
+
+    def test_bridge_unparseable_old_file_no_preserve(self):
+        with open(self.script, "w") as f:
+            f.write('BRIDGE = os.path.expanduser("~/x")\ndef broken(:\n')
+        RAW["ilink.py"] = self.NEW_WITH_DEFAULT
+        code, out = run_update("v1.3.0", script_path=self.script)
+        self.assertEqual(code, 0)
+        self.assertNotIn("PRESERVED:BRIDGE", out)
+        self.assertEqual(self.read(self.script), self.NEW_WITH_DEFAULT)
 
 
 if __name__ == "__main__":

@@ -338,7 +338,7 @@ def cmd_prune_media(max_age_days=MEDIA_PRUNE_MAX_AGE_DAYS,
 # release — a forgotten bump makes every deployment report itself
 # outdated forever, since the check compares this constant with the
 # latest release tag.
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 VERSION_CHECK_URL = ("https://api.github.com/repos/gfydfhcf/"
                      "wechat-ilink-muse-bridge/releases/latest")
 VERSION_NOTIFY_FILE = os.path.join(BRIDGE, "version_notify.json")
@@ -622,6 +622,9 @@ def _clear_update_offer():
 # verify everything first, then swap everything (backups kept as
 # .bak-<tag>). Any verification failure replaces nothing. State files
 # (session, owner, contacts, ledgers, caches) are never touched.
+# A deployment's local BRIDGE override is preserved across the swap
+# (the release file always carries the repo default); see
+# _preserve_bridge.
 UPDATE_RAW_BASE = ("https://raw.githubusercontent.com/gfydfhcf/"
                    "wechat-ilink-muse-bridge")
 UPDATE_COMPARE_URL = ("https://api.github.com/repos/gfydfhcf/"
@@ -711,6 +714,57 @@ def _verify_shell_source(source):
     return None
 
 
+def _bridge_block(source):
+    """Top-level BRIDGE assignment in <source> as (start, end, text),
+    start/end 1-based line numbers (end exclusive), or None when the
+    source has no such assignment or does not parse. Found with ast
+    so both the single-line production override and the repo's
+    multi-line default are extracted exactly."""
+    import ast
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "BRIDGE":
+                    lines = source.splitlines(keepends=True)
+                    start = node.lineno
+                    end = (node.end_lineno or node.lineno) + 1
+                    return (start, end,
+                            "".join(lines[start - 1:end - 1]))
+    return None
+
+
+def _preserve_bridge(old_source, new_source):
+    """Return (content, preserved): <new_source> with its BRIDGE
+    assignment replaced by the old file's, when the old file carries
+    a BRIDGE assignment that differs from the new file's. A missing
+    or unparseable BRIDGE in either file, or identical blocks, means
+    'nothing to preserve' — the new file installs as-is. This keeps
+    a deployment's local BRIDGE override (e.g. a production path
+    that differs from the repo default) across updates; without it
+    update-to would silently install the repo default and the bridge
+    would look for its session in the wrong directory. A deployment
+    that never customized BRIDGE is unaffected. (If the repo itself
+    ever changes its BRIDGE default, a deployment keeps its old
+    value until the operator edits it — still a working BRIDGE.)"""
+    old = _bridge_block(old_source)
+    new = _bridge_block(new_source)
+    if old is None or new is None:
+        return new_source, False
+    if old[2] == new[2]:
+        return new_source, False
+    old_text = old[2]
+    if not old_text.endswith("\n"):
+        old_text += "\n"
+    lines = new_source.splitlines(keepends=True)
+    start, end = new[0], new[1]
+    return ("".join(lines[:start - 1]) + old_text
+            + "".join(lines[end - 1:])), True
+
+
 def _copy_file(src, dst):
     with open(src, "rb") as f_in, open(dst, "wb") as f_out:
         f_out.write(f_in.read())
@@ -777,6 +831,24 @@ def cmd_update_to(tag, hook_dir=None, script_path=None):
         print(f"WARNING: no ilink.py sha256 in release notes for "
               f"{head}; installing without hash check",
               file=sys.stderr, flush=True)
+    # Preserve a deployment's local BRIDGE override (see
+    # _preserve_bridge): the release file always carries the repo
+    # default, and installing it verbatim would move the bridge's
+    # data directory. The hash above was checked on the pristine
+    # download, so re-verify the spliced source before planning it.
+    preserved_bridge = False
+    try:
+        with open(script_path) as f:
+            old_src = f.read()
+    except OSError:
+        old_src = None
+    if old_src is not None:
+        src, preserved_bridge = _preserve_bridge(old_src, src)
+        if preserved_bridge:
+            err = _verify_python_source(src)
+            if err:
+                print(f"UPDATE_FAILED:verify:ilink.py:{err[:200]}")
+                return 1
     plan.append(("ilink.py", script_path, src))
     script_lines = []
     if hook_dir and not compare_ok:
@@ -866,6 +938,8 @@ def cmd_update_to(tag, hook_dir=None, script_path=None):
         if kind == "AGENTS.md.new":
             continue
         print(f"UPDATED:{kind}")
+    if preserved_bridge:
+        print("PRESERVED:BRIDGE")
     for line in script_lines:
         print(line)
     if contract_line:
